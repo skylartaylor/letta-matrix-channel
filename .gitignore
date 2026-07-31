@@ -1,0 +1,6 @@
+node_modules/
+runtime/
+state/
+accounts.json
+.env
+.DS_Store

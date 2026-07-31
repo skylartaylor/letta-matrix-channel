@@ -1,0 +1,23 @@
+{
+  "accounts": [
+    {
+      "channel": "matrix",
+      "accountId": "main",
+      "displayName": "Matrix",
+      "enabled": true,
+      "dmPolicy": "allowlist",
+      "groupPolicy": "allowlist",
+      "allowedUsers": ["@sky:example.org"],
+      "config": {
+        "homeserverUrl": "https://matrix.example.org",
+        "bot_token": "PASTE_DEDICATED_BOT_ACCESS_TOKEN_HERE",
+        "allowedRooms": ["!replace-with-room-id:example.org"],
+        "allowedUsers": ["@sky:example.org"],
+        "requireMention": true,
+        "mentionAliases": ["matrix"]
+      },
+      "createdAt": "2026-07-27T00:00:00.000Z",
+      "updatedAt": "2026-07-27T00:00:00.000Z"
+    }
+  ]
+}

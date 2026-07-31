@@ -1,0 +1,7 @@
+{
+  "id": "matrix",
+  "displayName": "Matrix",
+  "entry": "./plugin.mjs",
+  "runtimePackages": ["matrix-js-sdk@34.11.1"],
+  "runtimeModules": ["matrix-js-sdk"]
+}

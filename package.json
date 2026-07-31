@@ -1,0 +1,12 @@
+{
+  "name": "letta-matrix-channel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A Matrix custom channel for Letta Code.",
+  "scripts": {
+    "test": "node channel/test/plugin.test.mjs",
+    "check": "node --check channel/plugin.mjs"
+  },
+  "license": "Apache-2.0"
+}
