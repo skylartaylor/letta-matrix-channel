@@ -9,6 +9,8 @@ import {
   restoreCryptoState,
 } from "./idb-state.mjs";
 
+globalThis.indexedDB = indexedDB;
+
 function request(request) {
   return new Promise((resolve, reject) => {
     request.addEventListener("success", () => resolve(request.result), { once: true });

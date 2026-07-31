@@ -10,12 +10,18 @@ import { open, readFile, rename, rm } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { deserialize, serialize } from "node:v8";
-import { indexedDB } from "fake-indexeddb";
 
 const SNAPSHOT_FILE = "crypto-idb.snapshot";
 const PREVIOUS_SNAPSHOT_FILE = "crypto-idb.snapshot.previous";
 const LOCK_FILE = "crypto-idb.lock";
 const SNAPSHOT_VERSION = 1;
+
+function cryptoIndexedDb() {
+  if (!globalThis.indexedDB) {
+    throw new Error("Matrix crypto runtime has not installed IndexedDB");
+  }
+  return globalThis.indexedDB;
+}
 
 function requestResult(request) {
   return new Promise((resolve, reject) => {
@@ -98,6 +104,7 @@ export async function acquireCryptoStateLock(stateDir) {
 }
 
 async function dumpDatabase(name, version) {
+  const indexedDB = cryptoIndexedDb();
   const database = await new Promise((resolve, reject) => {
     const request = indexedDB.open(name, version);
     request.addEventListener("success", () => resolve(request.result), { once: true });
@@ -133,6 +140,7 @@ async function dumpDatabase(name, version) {
 
 export async function persistCryptoState(stateDir) {
   ensureStateDirectory(stateDir);
+  const indexedDB = cryptoIndexedDb();
   const databases = await indexedDB.databases();
   const snapshot = [];
   for (const { name, version } of databases) {
@@ -162,6 +170,7 @@ export async function persistCryptoState(stateDir) {
 }
 
 async function restoreDatabase(snapshot) {
+  const indexedDB = cryptoIndexedDb();
   const database = await new Promise((resolve, reject) => {
     const request = indexedDB.open(snapshot.name, snapshot.version);
     request.addEventListener("upgradeneeded", () => {
@@ -217,4 +226,10 @@ export async function restoreCryptoState(stateDir) {
   }
   if (!lastError) return false;
   throw new Error(`Could not restore Matrix crypto state: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+}
+
+export async function clearInMemoryCryptoState() {
+  const indexedDB = cryptoIndexedDb();
+  const databases = await indexedDB.databases();
+  await Promise.all(databases.filter(({ name }) => name).map(({ name }) => requestResult(indexedDB.deleteDatabase(name))));
 }
