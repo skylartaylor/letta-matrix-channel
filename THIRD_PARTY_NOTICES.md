@@ -1,8 +1,9 @@
 # Third-party notices
 
-This project may include adapted source from OpenClaw's Matrix extension.
-When that code lands, the affected files will retain OpenClaw's MIT copyright
-notice and identify the adapted source path and commit in an adjacent header.
+`channel/crypto/idb-state.mjs` adapts OpenClaw's Matrix IndexedDB persistence
+approach from `extensions/matrix/src/matrix/sdk/idb-persistence.ts` (checked out
+at the public OpenClaw `main` revision available during this port). The file
+retains a source notice and this project keeps the required MIT attribution.
 
 OpenClaw is licensed under the MIT License:
 

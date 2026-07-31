@@ -8,5 +8,8 @@
     "test": "node channel/test/plugin.test.mjs",
     "check": "node --check channel/plugin.mjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.5"
+  }
 }
