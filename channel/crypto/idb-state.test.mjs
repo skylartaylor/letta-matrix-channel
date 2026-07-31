@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { indexedDB } from "fake-indexeddb";
@@ -47,7 +47,9 @@ try {
   opened.close();
 
   assert.equal(await persistCryptoState(stateDir), 1);
+  assert.equal(await persistCryptoState(stateDir), 1, "second snapshot preserves a prior generation");
   await deleteDatabase(dbName);
+  await writeFile(join(stateDir, "crypto-idb.snapshot"), "corrupt latest snapshot");
   assert.equal(await restoreCryptoState(stateDir), true);
 
   const restored = await request(indexedDB.open(dbName, 1));

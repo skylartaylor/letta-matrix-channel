@@ -6,13 +6,14 @@
 // per-account state directory. Snapshot values use v8 serialization rather
 // than JSON so Uint8Array and ArrayBuffer crypto records round-trip intact.
 
-import { open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { open, readFile, rename, rm } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { deserialize, serialize } from "node:v8";
 import { indexedDB } from "fake-indexeddb";
 
 const SNAPSHOT_FILE = "crypto-idb.snapshot";
+const PREVIOUS_SNAPSHOT_FILE = "crypto-idb.snapshot.previous";
 const LOCK_FILE = "crypto-idb.lock";
 const SNAPSHOT_VERSION = 1;
 
@@ -33,6 +34,10 @@ function transactionComplete(transaction) {
 
 function statePath(stateDir) {
   return join(stateDir, SNAPSHOT_FILE);
+}
+
+function previousStatePath(stateDir) {
+  return join(stateDir, PREVIOUS_SNAPSHOT_FILE);
 }
 
 function lockPath(stateDir) {
@@ -136,8 +141,22 @@ export async function persistCryptoState(stateDir) {
   }
   const payload = serialize({ version: SNAPSHOT_VERSION, databases: snapshot });
   const target = statePath(stateDir);
+  const previous = previousStatePath(stateDir);
   const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temporary, payload, { mode: 0o600 });
+  const handle = await open(temporary, "w", 0o600);
+  try {
+    await handle.writeFile(payload);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  // Keep one known-good generation. A crash between these renames leaves the
+  // previous generation intact; restoreCryptoState() will use it explicitly.
+  try {
+    await rename(target, previous);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
   await rename(temporary, target);
   return snapshot.length;
 }
@@ -179,17 +198,23 @@ async function restoreDatabase(snapshot) {
 }
 
 export async function restoreCryptoState(stateDir) {
-  const target = statePath(stateDir);
-  let payload;
-  try {
-    payload = deserialize(await readFile(target));
-  } catch (error) {
-    if (error?.code === "ENOENT") return false;
-    throw new Error(`Could not restore Matrix crypto state: ${error instanceof Error ? error.message : String(error)}`);
+  const candidates = [statePath(stateDir), previousStatePath(stateDir)];
+  let lastError = null;
+  for (const candidate of candidates) {
+    let payload;
+    try {
+      payload = deserialize(await readFile(candidate));
+      if (payload?.version !== SNAPSHOT_VERSION || !Array.isArray(payload.databases)) {
+        throw new Error("unsupported snapshot format");
+      }
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      lastError = error;
+      continue;
+    }
+    for (const database of payload.databases) await restoreDatabase(database);
+    return true;
   }
-  if (payload?.version !== SNAPSHOT_VERSION || !Array.isArray(payload.databases)) {
-    throw new Error("Matrix crypto state snapshot has an unsupported format");
-  }
-  for (const database of payload.databases) await restoreDatabase(database);
-  return true;
+  if (!lastError) return false;
+  throw new Error(`Could not restore Matrix crypto state: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
