@@ -8,5 +8,5 @@
     "test": "node channel/test/plugin.test.mjs",
     "check": "node --check channel/plugin.mjs"
   },
-  "license": "Apache-2.0"
+  "license": "MIT"
 }
