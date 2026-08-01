@@ -35,9 +35,14 @@ the same within a smaller Letta-oriented boundary.
    the owning PID and asks the caller to retry; a dead or malformed transition
    gate fails closed for operator recovery.
 5. State persistence serializes binary IndexedDB records without JSON loss,
-   retains a previous known-good generation, uses one readonly transaction per
-   crypto database plus atomic file replacement, and serializes periodic,
-   explicit-barrier, and shutdown checkpoints.
+   retains a previous generation as forensic evidence only, uses
+   one readonly transaction per crypto database plus atomic file replacement,
+   and serializes periodic, explicit-barrier, and shutdown checkpoints.
+   Publishing a new snapshot never removes the authoritative current path:
+   the old current is hard-linked through a temporary previous candidate
+   before the new temporary atomically replaces current.
+   Previous-generation promotion is forbidden, whether automatic or manual,
+   because ratchet rollback can reuse keys or outbound message indices.
 6. Outbound messages are allowed only after initial sync has loaded room
    encryption state and while the SDK reports that state as current. Any
    reconnect, catch-up, stopped, or error state closes the outbound gate until
@@ -74,11 +79,11 @@ Install the fake IndexedDB runtime, enforce single encrypted-account ownership,
 restore state, initialize Rust crypto before sync, and snapshot at startup,
 periodically, on clean stop, and at exposed sync/key-processing barriers.
 
-These checkpoints reduce the amount of state exposed to a process crash; they
-do not yet prove crash consistency. Previous-generation recovery can roll state
-back, and fake-IndexedDB snapshots cannot transact across both crypto
-databases. Ratchet and outbound Megolm-index safety remain real encrypted-room
-crash/restart test requirements before E2EE support can be claimed.
+These checkpoints reduce the amount of state exposed to a process crash.
+Fake-IndexedDB snapshots cannot transact across both crypto databases, so
+encrypted network writes pass a serialized snapshot barrier after the SDK
+advances crypto state and before the request reaches the network.
+Previous-generation rollback remains forbidden.
 
 Clean shutdown advances through a final snapshot, owned active-marker removal,
 filesystem-lock release, and process-guard release. Each destructive step
@@ -89,26 +94,45 @@ Ownership loss, malformed metadata, and dead transition gates are not
 advertised as retryable: they permanently quarantine encrypted startup in that
 process and require operator recovery.
 
-Until those tests exist, a runtime-active marker makes an unclean process exit
-fail closed on the next startup instead of automatically restoring a possibly
-stale ratchet snapshot. Operator-guided recovery for that marker is intentionally
-not part of this lifecycle slice. If Rust initialization rejects, the mandatory
-first snapshot fails, an IndexedDB delete is blocked, or Matrix client shutdown
-cannot be proven, the interval timer is stopped but the marker, filesystem
-lock, and process guard remain quarantined until process exit.
+The runtime-active marker makes an unclean process exit fail closed on the next
+startup. Recovery is an explicit offline operation: inspect the state, confirm
+the exact marker token plus homeserver/account/user/device identity, acquire
+and safely reclaim the dead owner's state lock, revalidate the secure marker,
+identity, and current snapshot under that lock, verify the marker PID is dead,
+then atomically move the marker to retained recovery evidence. Startup never
+auto-clears the marker, and recovery never selects the previous snapshot.
 
-Phase 2 still drops encrypted timeline events and refuses sends to encrypted
-rooms. Phase 3 and the real-room gate must land before either path is enabled.
+If Rust initialization rejects, the mandatory first snapshot fails, an
+IndexedDB delete is blocked, or Matrix client shutdown cannot be proven, the
+interval timer is stopped but the marker, filesystem lock, and process guard
+remain quarantined until process exit.
+
+Phase 3 and the real-room gate are now implemented. Encrypted delivery and
+sending are enabled only after guarded crypto startup; plaintext mode continues
+to drop encrypted timeline events and refuse sends to encrypted rooms.
 
 ### Phase 3 — decryption and trust policy
 
 Deliver only post-decryption `m.room.message` events through existing room,
 sender, mention, and dedupe gates. Handle withheld/missing keys explicitly.
-Record `shieldState(true)` telemetry without silently imposing a verified-only
-policy.
+Record strict shield telemetry, derived from the pinned SDK's public encryption
+and user-verification APIs, without silently imposing a verified-only policy.
 
 ### Phase 4 — real integration tests
 
 No release advertises E2EE until a real homeserver test proves encrypted inbound
 and outbound delivery, same-device restart, crash recovery, state corruption
 recovery, single-owner enforcement, and no plaintext send before sync.
+
+The Docker-backed `npm run test:e2ee` gate now proves real encrypted inbound and
+outbound wire events, peer decryption, same-device clean restart, device-key
+continuity, explicit recovery after SIGKILL both before the room fetch and
+after Synapse accepts the event, continued bidirectional encryption without
+Megolm-index reuse, corrupt-current fail-closed behavior, new-device bootstrap
+on an unused state directory with old-device revocation, cross-process
+state-lock enforcement, and no plaintext room-send request before or after
+sync.
+
+A missing or corrupt current snapshot is not recoverable as the same device.
+The operator must revoke that device through a trusted Matrix client, obtain a
+token bound to a new device ID, and bootstrap an unused state directory.
