@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { fork, spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,7 @@ import {
   prepareCryptoStateIdentity,
   requiresCryptoProcessQuarantine,
   restoreCryptoState,
+  validateCurrentCryptoSnapshot,
 } from "./idb-state.mjs";
 
 globalThis.indexedDB = indexedDB;
@@ -134,24 +135,52 @@ try {
     "one readonly transaction captures every store in the crypto database",
   );
   assert.equal(await persistCryptoState(stateDir), 1, "second snapshot preserves a prior generation");
+  const currentSnapshot = join(stateDir, "crypto-idb.snapshot");
+  const previousSnapshot = join(stateDir, "crypto-idb.snapshot.previous");
+  const validCurrentFixture = join(stateDir, "test-valid-current.snapshot");
+  for (const crashPoint of [
+    "new-snapshot-synced",
+    "previous-candidate-synced",
+    "previous-installed",
+    "current-installed",
+    "current-synced",
+  ]) {
+    await assert.rejects(
+      () => persistCryptoState(stateDir, {
+        onPublicationStep(step) {
+          assert.equal(
+            existsSync(currentSnapshot),
+            true,
+            `current snapshot exists at ${step}`,
+          );
+          if (step === crashPoint) throw new Error(`simulated crash at ${step}`);
+        },
+      }),
+      new RegExp(`simulated crash at ${crashPoint}`),
+    );
+    assert.deepEqual(
+      await validateCurrentCryptoSnapshot(stateDir),
+      { databaseCount: 1 },
+      `current snapshot remains valid after ${crashPoint}`,
+    );
+  }
+  await copyFile(currentSnapshot, validCurrentFixture);
   await deleteDatabase(dbName);
-  await writeFile(join(stateDir, "crypto-idb.snapshot"), "corrupt latest snapshot");
-  const rejectedBeforeCorruption = (await readdir(stateDir))
-    .filter((name) => name.startsWith("crypto-idb.snapshot.rejected.")).length;
-  const corruptRecovery = await restoreCryptoState(stateDir);
-  assert.equal(corruptRecovery?.generation, "previous");
-  assert.match(
-    corruptRecovery?.rejectedSnapshotPath ?? "",
-    /crypto-idb\.snapshot\.rejected\./,
+  await writeFile(currentSnapshot, "corrupt latest snapshot");
+  await assert.rejects(
+    () => restoreCryptoState(stateDir),
+    /previous-generation rollback is forbidden/,
   );
-  assert.equal(existsSync(join(stateDir, "crypto-idb.snapshot")), false);
+  assert.equal(existsSync(currentSnapshot), true, "the corrupt current snapshot is retained");
+  assert.equal(existsSync(previousSnapshot), true, "the previous snapshot is retained");
   assert.equal(
-    (await readdir(stateDir))
-      .filter((name) => name.startsWith("crypto-idb.snapshot.rejected.")).length,
-    rejectedBeforeCorruption + 1,
-    "fallback retains the rejected current snapshot for diagnosis",
+    (await indexedDB.databases()).some(({ name }) => name === dbName),
+    false,
+    "a corrupt current snapshot never restores the previous generation",
   );
 
+  await copyFile(validCurrentFixture, currentSnapshot);
+  assert.equal((await restoreCryptoState(stateDir))?.generation, "current");
   const restored = await request(indexedDB.open(dbName, 12));
   const readTx = restored.transaction("core", "readonly");
   const readComplete = complete(readTx);
@@ -162,46 +191,52 @@ try {
   restored.close();
 
   await deleteDatabase(dbName);
-  const missingCurrentRecovery = await restoreCryptoState(stateDir);
-  assert.equal(missingCurrentRecovery?.generation, "previous");
-  assert.equal(missingCurrentRecovery?.rejectedSnapshotPath, null);
-
-  await persistCryptoState(stateDir);
+  await rm(currentSnapshot);
+  await assert.rejects(
+    () => restoreCryptoState(stateDir),
+    /current snapshot is missing.*previous-generation rollback is forbidden/,
+  );
+  assert.equal(existsSync(previousSnapshot), true);
+  assert.equal(
+    (await indexedDB.databases()).some(({ name }) => name === dbName),
+    false,
+    "a missing current snapshot never restores the previous generation",
+  );
+  await copyFile(validCurrentFixture, currentSnapshot);
+  assert.equal((await restoreCryptoState(stateDir))?.generation, "current");
   await deleteDatabase(dbName);
   await writeFile(
-    join(stateDir, "crypto-idb.snapshot"),
+    currentSnapshot,
     serialize({
       version: 1,
       databases: [{ name: dbName, version: 12, stores: [] }],
     }),
   );
-  assert.equal((await restoreCryptoState(stateDir))?.generation, "previous");
-  assert.equal(existsSync(join(stateDir, "crypto-idb.snapshot")), false);
-  assert.equal(
-    (await readdir(stateDir))
-      .filter((name) => name.startsWith("crypto-idb.snapshot.rejected.")).length,
-    rejectedBeforeCorruption + 2,
+  await assert.rejects(
+    () => restoreCryptoState(stateDir),
+    /unsupported Matrix crypto database schema.*previous-generation rollback is forbidden/,
   );
-  const semanticFallback = await request(indexedDB.open(dbName, 12));
-  semanticFallback.close();
+  assert.equal(
+    (await indexedDB.databases()).some(({ name }) => name === dbName),
+    false,
+  );
 
-  await persistCryptoState(stateDir);
-  const missingAccount = deserialize(await readFile(join(stateDir, "crypto-idb.snapshot")));
+  await copyFile(validCurrentFixture, currentSnapshot);
+  const missingAccount = deserialize(await readFile(currentSnapshot));
   const core = missingAccount.databases[0].stores.find(({ name }) => name === "core");
   core.records = core.records.filter(({ key }) => key !== "account");
-  await deleteDatabase(dbName);
-  await writeFile(join(stateDir, "crypto-idb.snapshot"), serialize(missingAccount));
-  assert.equal(
-    (await restoreCryptoState(stateDir))?.generation,
-    "previous",
-    "a schema-valid snapshot without the Olm account falls back",
+  await writeFile(currentSnapshot, serialize(missingAccount));
+  await assert.rejects(
+    () => restoreCryptoState(stateDir),
+    /missing required Matrix crypto identity material.*previous-generation rollback is forbidden/,
   );
-  assert.equal(existsSync(join(stateDir, "crypto-idb.snapshot")), false);
   assert.equal(
-    (await readdir(stateDir))
-      .filter((name) => name.startsWith("crypto-idb.snapshot.rejected.")).length,
-    rejectedBeforeCorruption + 3,
+    (await indexedDB.databases()).some(({ name }) => name === dbName),
+    false,
+    "a snapshot missing the Olm account fails closed",
   );
+  await copyFile(validCurrentFixture, currentSnapshot);
+  assert.equal((await restoreCryptoState(stateDir))?.generation, "current");
   assert.equal(
     (await indexedDB.databases()).some(({ name }) => name === unrelatedDbName),
     true,

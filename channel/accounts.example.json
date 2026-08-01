@@ -14,7 +14,10 @@
         "allowedRooms": ["!replace-with-room-id:example.org"],
         "allowedUsers": ["@sky:example.org"],
         "requireMention": true,
-        "mentionAliases": ["matrix"]
+        "mentionAliases": ["matrix"],
+        "encryption": {
+          "enabled": false
+        }
       },
       "createdAt": "2026-07-27T00:00:00.000Z",
       "updatedAt": "2026-07-27T00:00:00.000Z"

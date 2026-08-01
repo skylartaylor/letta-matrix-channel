@@ -5,6 +5,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DecryptionFailureCode } from "matrix-js-sdk/lib/crypto-api/index.js";
+import {
+  decryptExistingEvent,
+  mkDecryptionFailureMatrixEvent,
+} from "matrix-js-sdk/lib/testing.js";
 import { installTestCryptoDatabase } from "../crypto/crypto-db-test-fixture.mjs";
 
 const SELF = "@matrix:example.org";
@@ -84,6 +89,18 @@ function room(extra = {}) {
   return { roomId: ROOM, name: "Matrix Test Room", getMember: () => ({ name: "Test User" }), ...extra };
 }
 
+function encryptedRoom(extra = {}) {
+  return room({
+    hasEncryptionStateEvent: () => true,
+    currentState: {
+      getStateEvents: (type, key) => (
+        type === "m.room.encryption" && key === "" ? { type } : null
+      ),
+    },
+    ...extra,
+  });
+}
+
 function messageEvent(id, body, extra = {}) {
   const content = { msgtype: "m.text", body, ...extra.content };
   return {
@@ -96,26 +113,83 @@ function messageEvent(id, body, extra = {}) {
   };
 }
 
+function encryptedMessageEvent(id, body, { state = "pending", sender = SENDER } = {}) {
+  let currentState = state;
+  let currentBody = body;
+  let failureReason = null;
+  const event = {
+    getType: () => (currentState === "pending" ? "m.room.encrypted" : "m.room.message"),
+    getWireType: () => "m.room.encrypted",
+    getContent: () => (
+      currentState === "decrypted"
+        ? { msgtype: "m.text", body: currentBody }
+        : { msgtype: "m.bad.encrypted", body: "synthetic decryption placeholder" }
+    ),
+    getId: () => id,
+    getRoomId: () => ROOM,
+    getSender: () => sender,
+    getTs: () => 1_700_000_000_000,
+    getUnsigned: () => ({}),
+    isDecryptionFailure: () => currentState === "failure",
+    emitDecryption({ decryptedBody, reason, error } = {}) {
+      if (reason) {
+        currentState = "failure";
+        failureReason = reason;
+      } else {
+        currentState = "decrypted";
+        failureReason = null;
+        if (typeof decryptedBody === "string") currentBody = decryptedBody;
+      }
+      return error;
+    },
+  };
+  Object.defineProperty(event, "decryptionFailureReason", {
+    get: () => failureReason,
+  });
+  return event;
+}
+
 async function emit(client, event, target = room()) {
   for (const handler of [...(client.handlers.get("Room.timeline") ?? [])]) {
     await handler(event, target, false, false, { liveEvent: true });
   }
 }
 
+async function emitDecryption(client, event, update) {
+  const error = event.emitDecryption(update);
+  for (const handler of [...(client.handlers.get("Event.decrypted") ?? [])]) {
+    await handler(event, error);
+  }
+}
+
+async function waitUntil(predicate, label) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
 const { channelPlugin } = await import("../plugin.mjs");
 
 function makeAdapter({ config = {}, client: clientOverrides = {} } = {}) {
   const client = makeClient(clientOverrides);
-  globalThis.__matrixCreateClient = () => client;
+  const createOptions = [];
+  globalThis.__matrixCreateClient = (options) => {
+    createOptions.push(options);
+    return client;
+  };
   const adapter = channelPlugin.createAdapter({ accountId: "main", config: { ...BASE_CONFIG, ...config } });
   const inbound = [];
   adapter.onMessage = async (message) => inbound.push(message);
-  return { adapter, client, inbound };
+  return { adapter, client, inbound, getCreateOptions: () => createOptions };
 }
 
 function makeFactoryAdapter({ clients, accountId = "main", config = {} }) {
   let createCount = 0;
-  globalThis.__matrixCreateClient = () => {
+  const createOptions = [];
+  globalThis.__matrixCreateClient = (options) => {
+    createOptions.push(options);
     const client = clients[createCount];
     createCount += 1;
     if (!client) throw new Error("Matrix test client factory exhausted");
@@ -127,7 +201,12 @@ function makeFactoryAdapter({ clients, accountId = "main", config = {} }) {
   });
   const inbound = [];
   adapter.onMessage = async (message) => inbound.push(message);
-  return { adapter, inbound, getCreateCount: () => createCount };
+  return {
+    adapter,
+    inbound,
+    getCreateCount: () => createCount,
+    getCreateOptions: () => createOptions,
+  };
 }
 
 function makeEncryptedClient(overrides = {}) {
@@ -148,6 +227,18 @@ function makeEncryptedClient(overrides = {}) {
       client.calls.push("whoami");
       return { user_id: SELF, device_id: DEVICE };
     };
+  }
+  if (!overrides.getCrypto) {
+    client.getCrypto = () => ({
+      getEncryptionInfoForEvent: async () => ({
+        shieldColour: 0,
+        shieldReason: null,
+      }),
+      getUserVerificationStatus: async () => ({
+        isVerified: () => true,
+        needsUserApproval: false,
+      }),
+    });
   }
   return client;
 }
@@ -964,7 +1055,7 @@ try {
     assert.equal(inbound.length, 0);
   });
 
-  await test("ignores encrypted events and warns once per room", async () => {
+  await test("ignores unsafe encryption events and warns once per condition per room", async () => {
     const warnings = [];
     const warn = console.warn;
     console.warn = (line) => warnings.push(line);
@@ -976,11 +1067,324 @@ try {
       const quicklyDecrypted = messageEvent("$enc3", "matrix decrypted too early");
       quicklyDecrypted.getWireType = () => "m.room.encrypted";
       await emit(client, quicklyDecrypted);
+      await emit(
+        client,
+        messageEvent("$clear-in-encrypted", "matrix injected cleartext"),
+        encryptedRoom(),
+      );
+      await emit(
+        client,
+        messageEvent("$clear-in-encrypted-2", "matrix injected cleartext again"),
+        encryptedRoom(),
+      );
       assert.equal(inbound.length, 0);
-      assert.equal(warnings.length, 1);
+      assert.equal(warnings.length, 2);
       assert.match(warnings[0], /ignoring E2EE event/);
+      assert.match(warnings[1], /room\/wire encryption mismatch/);
     } finally {
       console.warn = warn;
+    }
+  });
+
+  await test("encrypted mode delivers already-decrypted live messages with shield telemetry", async () => {
+    const stateDir = makeCryptoStateDir("decrypted-inbound");
+    const shieldEvents = [];
+    const telemetry = [];
+    const quietInfo = console.info;
+    console.info = (...args) => telemetry.push(args.join(" "));
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      getCrypto: () => ({
+        getEncryptionInfoForEvent: async (event) => {
+          shieldEvents.push(event.getId());
+          return { shieldColour: 2, shieldReason: 0 };
+        },
+        getUserVerificationStatus: async () => ({
+          isVerified: () => false,
+          wasCrossSigningVerified: () => true,
+          needsUserApproval: false,
+        }),
+      }),
+    });
+    const { adapter, inbound } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      const encrypted = encryptedMessageEvent("$decrypted", "matrix secret", {
+        state: "decrypted",
+      });
+      await emit(client, encrypted, encryptedRoom());
+      await waitUntil(() => inbound.length === 1, "already-decrypted delivery");
+      await emit(client, encrypted, encryptedRoom());
+      assert.equal(inbound.length, 1, "encrypted delivery uses the existing event-id dedupe");
+      assert.deepEqual(shieldEvents, ["$decrypted"]);
+      assert.match(
+        telemetry.join("\n"),
+        /semantics=strict colour=red reason=unverified_identity/,
+      );
+      assert.equal(inbound[0].text, "matrix secret");
+    } finally {
+      console.info = quietInfo;
+      await adapter.stop();
+    }
+  });
+
+  await test("encrypted inbound delivery fails closed when its crypto checkpoint fails", async () => {
+    const stateDir = makeCryptoStateDir("decrypted-inbound-checkpoint");
+    const errors = [];
+    const quietError = console.error;
+    console.error = (...args) => errors.push(args.join(" "));
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+    });
+    const { adapter, inbound } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      const realPersist = adapter.cryptoRuntime.persist.bind(adapter.cryptoRuntime);
+      adapter.cryptoRuntime.persist = async () => {
+        throw new Error("synthetic checkpoint failure");
+      };
+      const encrypted = encryptedMessageEvent("$checkpoint-failure", "matrix secret", {
+        state: "decrypted",
+      });
+      await emit(client, encrypted, encryptedRoom());
+      await waitUntil(() => errors.length === 1, "failed inbound crypto checkpoint");
+      assert.equal(inbound.length, 0);
+      assert.equal(adapter.seenEventIds.has("$checkpoint-failure"), false);
+      assert.match(errors.join("\n"), /crypto persistence checkpoint failed/);
+
+      adapter.cryptoRuntime.persist = realPersist;
+      await emit(client, encrypted, encryptedRoom());
+      await waitUntil(() => inbound.length === 1, "retried inbound delivery");
+      assert.equal(inbound.length, 1, "the SDK may retry after persistence recovers");
+    } finally {
+      console.error = quietError;
+      await adapter.stop();
+    }
+  });
+
+  await test("encrypted mode rejects room and wire encryption mismatches", async () => {
+    const stateDir = makeCryptoStateDir("inbound-encryption-mismatch");
+    const warnings = [];
+    const warn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(" "));
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const { adapter, inbound } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+
+      await emit(
+        client,
+        messageEvent("$clear-in-encrypted", "matrix injected cleartext"),
+        encryptedRoom(),
+      );
+      await emit(
+        client,
+        encryptedMessageEvent("$encrypted-in-clear", "matrix wrong state", {
+          state: "decrypted",
+        }),
+        room(),
+      );
+
+      assert.equal(inbound.length, 0);
+      assert.equal(warnings.length, 1, "mismatch diagnostics are bounded per room");
+      assert.match(warnings[0], /room\/wire encryption mismatch/);
+    } finally {
+      console.warn = warn;
+      await adapter.stop();
+    }
+  });
+
+  await test("missing encrypted keys are diagnosed and a later SDK retry delivers once", async () => {
+    const stateDir = makeCryptoStateDir("decryption-retry");
+    const warnings = [];
+    const warn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(" "));
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const { adapter, inbound } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      const encrypted = encryptedMessageEvent("$withheld", "matrix recovered");
+      await emit(client, encrypted, encryptedRoom());
+      assert.equal((client.handlers.get("Event.decrypted") ?? []).length, 1);
+      await emitDecryption(client, encrypted, {
+        reason: "MEGOLM_UNKNOWN_INBOUND_SESSION_ID",
+        error: Object.assign(new Error("do not log this detail"), { code: "UNSAFE DETAIL" }),
+      });
+      await waitUntil(() => warnings.length === 1, "decryption failure diagnostic");
+      assert.match(
+        warnings[0],
+        /room=!room:example\.org event=\$withheld reason=MEGOLM_UNKNOWN_INBOUND_SESSION_ID status=missing_key; waiting for SDK key updates/,
+      );
+      assert.doesNotMatch(warnings[0], /do not log this detail|synthetic decryption placeholder/);
+      assert.equal(inbound.length, 0);
+
+      await emitDecryption(client, encrypted, { decryptedBody: "matrix recovered" });
+      await waitUntil(() => inbound.length === 1, "retried decryption delivery");
+      await emitDecryption(client, encrypted, { decryptedBody: "matrix duplicate" });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(inbound.length, 1);
+      assert.equal((client.handlers.get("Event.decrypted") ?? []).length, 1);
+      assert.equal(inbound[0].text, "matrix recovered");
+    } finally {
+      console.warn = warn;
+      await adapter.stop();
+    }
+  });
+
+  await test("withheld and terminal decryption failures get distinct safe diagnostics", async () => {
+    const stateDir = makeCryptoStateDir("decryption-diagnostics");
+    const warnings = [];
+    const warn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(" "));
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const { adapter, inbound } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      const withheld = encryptedMessageEvent("$withheld-diagnostic", "secret withheld");
+      const terminal = encryptedMessageEvent("$terminal-diagnostic", "secret terminal");
+      await emit(client, withheld, encryptedRoom());
+      await emit(client, terminal, encryptedRoom());
+      await emitDecryption(client, withheld, {
+        reason: "MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE",
+        error: new Error("private withheld detail"),
+      });
+      await emitDecryption(client, terminal, {
+        reason: "MEGOLM_BAD_ROOM",
+        error: new Error("private terminal detail"),
+      });
+      await waitUntil(() => warnings.length === 2, "classified decryption diagnostics");
+      assert.match(warnings[0], /reason=MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE status=withheld; no adapter retry/);
+      assert.match(warnings[1], /reason=MEGOLM_BAD_ROOM status=terminal; no adapter retry/);
+      assert.doesNotMatch(
+        warnings.join("\n"),
+        /private withheld detail|private terminal detail|secret withheld|secret terminal/,
+      );
+      assert.equal(inbound.length, 0);
+    } finally {
+      console.warn = warn;
+      await adapter.stop();
+    }
+  });
+
+  await test("real MatrixEvent retry emits post-decryption delivery", async () => {
+    const stateDir = makeCryptoStateDir("real-event-decryption-retry");
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const { adapter, inbound } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      const encrypted = await mkDecryptionFailureMatrixEvent({
+        roomId: ROOM,
+        sender: SENDER,
+        eventId: "$real-sdk-retry",
+        code: DecryptionFailureCode.MEGOLM_UNKNOWN_INBOUND_SESSION_ID,
+        msg: "test key is not available yet",
+      });
+      await emit(client, encrypted, encryptedRoom());
+      await decryptExistingEvent(encrypted, {
+        plainType: "m.room.message",
+        plainContent: { msgtype: "m.text", body: "matrix real retry" },
+      });
+      for (const handler of client.handlers.get("Event.decrypted") ?? []) {
+        await handler(encrypted);
+      }
+      await waitUntil(() => inbound.length === 1, "real MatrixEvent decrypted retry");
+      assert.equal(inbound[0].text, "matrix real retry");
+      assert.equal((client.handlers.get("Event.decrypted") ?? []).length, 1);
+    } finally {
+      await adapter.stop();
+    }
+  });
+
+  await test("encrypted decryption observers are removed on stop", async () => {
+    const stateDir = makeCryptoStateDir("decryption-stop");
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const { adapter, inbound } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    await adapter.start();
+    for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+    const encrypted = encryptedMessageEvent("$pending-stop", "matrix late");
+      await emit(client, encrypted, encryptedRoom());
+      assert.equal((client.handlers.get("Event.decrypted") ?? []).length, 1);
+      await adapter.stop();
+      assert.equal((client.handlers.get("Event.decrypted") ?? []).length, 0);
+      await emitDecryption(client, encrypted);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(inbound.length, 0);
+  });
+
+  await test("an old lifecycle cannot deliver after encrypted telemetry awaits", async () => {
+    const stateDir = makeCryptoStateDir("decryption-lifecycle-race");
+    let enterTelemetry;
+    let releaseTelemetry;
+    const telemetryEntered = new Promise((resolve) => {
+      enterTelemetry = resolve;
+    });
+    const telemetryGate = new Promise((resolve) => {
+      releaseTelemetry = resolve;
+    });
+    const firstClient = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      getCrypto: () => ({
+        getEncryptionInfoForEvent: async () => {
+          enterTelemetry();
+          await telemetryGate;
+          return { shieldColour: 0, shieldReason: null };
+        },
+        getUserVerificationStatus: async () => ({
+          isVerified: () => true,
+          needsUserApproval: false,
+        }),
+      }),
+    });
+    const secondClient = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [firstClient, secondClient],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await made.adapter.start();
+      for (const handler of firstClient.handlers.get("sync") ?? []) handler("PREPARED");
+      await emit(
+        firstClient,
+        encryptedMessageEvent("$old-lifecycle", "matrix stale", { state: "decrypted" }),
+        encryptedRoom(),
+      );
+      await telemetryEntered;
+      await made.adapter.stop();
+      await made.adapter.start();
+      for (const handler of secondClient.handlers.get("sync") ?? []) handler("PREPARED");
+      releaseTelemetry();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(made.inbound.length, 0);
+    } finally {
+      releaseTelemetry?.();
+      await made.adapter.stop();
     }
   });
 
@@ -1220,15 +1624,18 @@ try {
       config: { ackReaction: true },
       client: {
         getRoom: () => ({
+          hasEncryptionStateEvent: () => true,
           currentState: {
-            getStateEvents: (type, key) => (
-              type === "m.room.encryption" && key === "" ? { type } : null
-            ),
+            getStateEvents: () => null,
           },
         }),
       },
     });
-    await emit(client, messageEvent("$encrypted-room-cleartext", "matrix hi"));
+    await emit(
+      client,
+      messageEvent("$encrypted-room-cleartext", "matrix hi"),
+      encryptedRoom(),
+    );
     await adapter.handleTurnLifecycleEvent({
       type: "finished",
       outcome: "completed",
@@ -1238,7 +1645,7 @@ try {
         messageId: "$encrypted-room-cleartext",
       }],
     });
-    assert.equal(inbound.length, 1, "cleartext timeline handling is unchanged");
+    assert.equal(inbound.length, 0, "cleartext injection into an encrypted room is dropped");
     assert.equal(
       client.outbound.filter(([, type]) => type === "m.reaction").length,
       0,
@@ -1325,6 +1732,164 @@ try {
       assert.equal(client.outbound.length, 0);
     } finally {
       await adapter.stop();
+    }
+  });
+
+  await test("encrypted mode delegates encrypted-room messages to the initialized SDK", async () => {
+    const stateDir = makeCryptoStateDir("encrypted-outbound");
+    const cryptoApi = {};
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      getCrypto: () => cryptoApi,
+      getRoom: () => ({
+        hasEncryptionStateEvent: () => true,
+        currentState: { getStateEvents: () => ({ type: "m.room.encryption" }) },
+      }),
+    });
+    const { adapter } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      const result = await adapter.sendMessage({ chatId: ROOM, text: "matrix encrypted hello" });
+      assert.equal(result.messageId, "$reply");
+      assert.deepEqual(client.outbound, [[
+        ROOM,
+        "m.room.message",
+        { msgtype: "m.text", body: "matrix encrypted hello" },
+      ]]);
+    } finally {
+      await adapter.stop();
+    }
+  });
+
+  await test("encrypted Matrix requests persist before reaching the network", async () => {
+    const stateDir = makeCryptoStateDir("encrypted-request-barrier");
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    const errors = console.error;
+    try {
+      await made.adapter.start();
+      const fetchFn = made.getCreateOptions()[0].fetchFn;
+      const order = [];
+      made.adapter.cryptoRuntime.persist = async () => {
+        order.push("persist");
+      };
+      made.adapter.networkFetch = async () => {
+        order.push("fetch");
+        return { ok: true };
+      };
+
+      await fetchFn("https://example.org/_matrix/client/v3/sync");
+      assert.deepEqual(order, ["fetch"], "ordinary requests do not force a crypto snapshot");
+      order.length = 0;
+      await fetchFn(
+        "https://example.org/_matrix/client/v3/rooms/%21room%3Aexample.org/send/m.room.encrypted/txn",
+        { method: "PUT" },
+      );
+      assert.deepEqual(order, ["persist", "fetch"]);
+      order.length = 0;
+      await fetchFn(
+        "https://example.org/_matrix/client/v3/sendToDevice/m.room.encrypted/txn",
+        { method: "PUT" },
+      );
+      assert.deepEqual(order, ["persist", "fetch"]);
+      order.length = 0;
+      await fetchFn(
+        "https://example.org/_matrix/client/v3/keys/upload",
+        { method: "POST" },
+      );
+      assert.deepEqual(order, ["persist", "fetch"]);
+      order.length = 0;
+      await fetchFn(
+        "https://example.org/%ZZ/proxy/_matrix/client/v3/rooms/%21room%3Aexample.org/send/m.room.encrypted/txn",
+        { method: "PUT" },
+      );
+      assert.deepEqual(
+        order,
+        ["persist", "fetch"],
+        "a malformed unrelated base-path escape cannot bypass the barrier",
+      );
+      order.length = 0;
+
+      made.adapter.cryptoRuntime.persist = async () => {
+        order.push("persist-failed");
+        throw new Error("injected write-ahead failure");
+      };
+      console.error = () => {};
+      await assert.rejects(
+        () => fetchFn(
+          "https://example.org/_matrix/client/v3/rooms/%21room%3Aexample.org/send/m.room.encrypted/rejected",
+          { method: "PUT" },
+        ),
+        /refusing Matrix encrypted request without a current persisted crypto runtime/,
+      );
+      assert.deepEqual(order, ["persist-failed"], "ciphertext never reaches fetch after a failed barrier");
+      order.length = 0;
+      made.adapter.cryptoRuntime.persist = async () => {
+        order.push("persist-recovered");
+      };
+      await fetchFn(
+        "https://example.org/_matrix/client/v3/rooms/%21room%3Aexample.org/send/m.room.encrypted/recovered",
+        { method: "PUT" },
+      );
+      assert.deepEqual(
+        order,
+        ["persist-recovered", "fetch"],
+        "the next product request retries the barrier after a transient failure",
+      );
+    } finally {
+      console.error = errors;
+      await made.adapter.stop();
+    }
+  });
+
+  await test("stopping during an encrypted request barrier prevents the network write", async () => {
+    const stateDir = makeCryptoStateDir("encrypted-request-stop-race");
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    let enterBarrier;
+    let releaseBarrier;
+    const barrierEntered = new Promise((resolve) => {
+      enterBarrier = resolve;
+    });
+    const barrierGate = new Promise((resolve) => {
+      releaseBarrier = resolve;
+    });
+    let networkCalls = 0;
+    try {
+      await made.adapter.start();
+      made.adapter.cryptoRuntime.persist = async () => {
+        enterBarrier();
+        await barrierGate;
+      };
+      made.adapter.networkFetch = async () => {
+        networkCalls += 1;
+        return { ok: true };
+      };
+      const request = made.getCreateOptions()[0].fetchFn(
+        "https://example.org/_matrix/client/v3/rooms/%21room%3Aexample.org/send/m.room.encrypted/racing",
+        { method: "PUT" },
+      );
+      await barrierEntered;
+      await made.adapter.stop();
+      releaseBarrier();
+      await assert.rejects(
+        () => request,
+        /refusing Matrix encrypted request without a current persisted crypto runtime/,
+      );
+      assert.equal(networkCalls, 0);
+    } finally {
+      releaseBarrier?.();
+      await made.adapter.stop();
     }
   });
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -168,49 +168,55 @@ try {
     client: makeRuntimeClient(async () => { await writeProbe("recoverable"); }),
   });
   await recoverable.stop();
+  const recoverableSnapshotFixture = join(roots[3], "recoverable-current.snapshot");
+  await copyFile(
+    join(stateD, "crypto-idb.snapshot"),
+    recoverableSnapshotFixture,
+  );
   await writeFile(join(stateD, "crypto-idb.snapshot"), "corrupt current snapshot");
-  const recoveryDiagnostics = [];
-  const originalConsoleError = console.error;
-  let recovered;
-  try {
-    console.error = (...args) => recoveryDiagnostics.push(args.join(" "));
-    recovered = await startCryptoRuntime({
+  let corruptSnapshotInit = false;
+  await assert.rejects(
+    () => startCryptoRuntime({
       accountKey: "recoverable",
       stateDir: stateD,
       identity: recoverableIdentity,
       client: makeRuntimeClient(async () => {
-        assert.equal(await readProbe(), "recoverable");
+        corruptSnapshotInit = true;
       }),
-    });
-  } finally {
-    console.error = originalConsoleError;
-  }
-  assert.match(
-    recoveryDiagnostics.join("\n"),
-    /current crypto snapshot was rejected; restored the previous generation/,
+    }),
+    /previous-generation rollback is forbidden/,
   );
+  assert.equal(corruptSnapshotInit, false);
+  assert.equal(existsSync(join(stateD, "crypto-idb.snapshot.previous")), true);
+
+  await copyFile(
+    recoverableSnapshotFixture,
+    join(stateD, "crypto-idb.snapshot"),
+  );
+  const recovered = await startCryptoRuntime({
+    accountKey: "recoverable",
+    stateDir: stateD,
+    identity: recoverableIdentity,
+    client: makeRuntimeClient(async () => {
+      assert.equal(await readProbe(), "recoverable");
+    }),
+  });
   await recovered.stop();
   await rm(join(stateD, "crypto-idb.snapshot"));
-  const missingSnapshotDiagnostics = [];
-  let recoveredAfterMissingCurrent;
-  try {
-    console.error = (...args) => missingSnapshotDiagnostics.push(args.join(" "));
-    recoveredAfterMissingCurrent = await startCryptoRuntime({
+  let missingSnapshotInit = false;
+  await assert.rejects(
+    () => startCryptoRuntime({
       accountKey: "recoverable",
       stateDir: stateD,
       identity: recoverableIdentity,
       client: makeRuntimeClient(async () => {
-        assert.equal(await readProbe(), "recoverable");
+        missingSnapshotInit = true;
       }),
-    });
-  } finally {
-    console.error = originalConsoleError;
-  }
-  assert.match(
-    missingSnapshotDiagnostics.join("\n"),
-    /current crypto snapshot was missing; restored the previous generation/,
+    }),
+    /current snapshot is missing.*previous-generation rollback is forbidden/,
   );
-  await recoveredAfterMissingCurrent.stop();
+  assert.equal(missingSnapshotInit, false);
+  assert.equal(existsSync(join(stateD, "crypto-idb.snapshot.previous")), true);
 
   let controllerTick;
   let controllerCleared = false;

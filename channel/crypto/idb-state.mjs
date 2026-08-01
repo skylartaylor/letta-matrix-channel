@@ -6,15 +6,14 @@
 // per-account state directory. Snapshot values use v8 serialization rather
 // than JSON so Uint8Array and ArrayBuffer crypto records round-trip intact.
 
-import { randomUUID } from "node:crypto";
-import { link, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { link, lstat, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { lstatSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { deserialize, serialize } from "node:v8";
 
 const SNAPSHOT_FILE = "crypto-idb.snapshot";
 const PREVIOUS_SNAPSHOT_FILE = "crypto-idb.snapshot.previous";
-const REJECTED_SNAPSHOT_PREFIX = "crypto-idb.snapshot.rejected";
 const IDENTITY_FILE = "crypto-identity.json";
 const LOCK_DIRECTORY = "crypto-idb.lock";
 const LOCK_TAKEOVER_DIRECTORY = "crypto-idb.lock.takeover";
@@ -213,10 +212,6 @@ function previousStatePath(stateDir) {
   return join(stateDir, PREVIOUS_SNAPSHOT_FILE);
 }
 
-function rejectedStatePath(stateDir) {
-  return join(stateDir, `${REJECTED_SNAPSHOT_PREFIX}.${Date.now()}-${randomUUID()}`);
-}
-
 function lockPath(stateDir) {
   return join(stateDir, LOCK_DIRECTORY);
 }
@@ -238,6 +233,11 @@ function ensureStateDirectory(stateDir) {
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
   }
+  assertSecureStateDirectory(stateDir);
+  return created;
+}
+
+function assertSecureStateDirectory(stateDir) {
   const metadata = lstatSync(stateDir);
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
     throw new Error("Matrix crypto state path must be a real directory");
@@ -245,7 +245,6 @@ function ensureStateDirectory(stateDir) {
   if ((metadata.mode & 0o777) !== 0o700) {
     throw new Error("Matrix crypto state directory permissions must be 0700");
   }
-  return created;
 }
 
 function activeRuntimePath(stateDir) {
@@ -955,11 +954,25 @@ async function readActiveMarker(path, missingMessage, malformedMessage) {
     if (error?.code === "ENOENT") throw terminalOwnershipError(missingMessage);
     throw error;
   }
+  let marker;
   try {
-    return JSON.parse(contents);
+    marker = JSON.parse(contents);
   } catch {
     throw terminalOwnershipError(malformedMessage);
   }
+  if (
+    marker?.version !== 1
+    || typeof marker.token !== "string"
+    || !OWNERSHIP_TOKEN_PATTERN.test(marker.token)
+    || !Number.isSafeInteger(marker.pid)
+    || marker.pid <= 0
+    || marker.pid > MAX_PROCESS_ID
+    || typeof marker.startedAt !== "string"
+    || !Number.isFinite(Date.parse(marker.startedAt))
+  ) {
+    throw terminalOwnershipError(malformedMessage);
+  }
+  return marker;
 }
 
 function createActiveMarkerClearer(stateDir, token, key) {
@@ -1120,7 +1133,10 @@ async function dumpDatabase(name, version) {
   }
 }
 
-export async function persistCryptoState(stateDir) {
+export async function persistCryptoState(
+  stateDir,
+  { onPublicationStep } = {},
+) {
   ensureStateDirectory(stateDir);
   const indexedDB = cryptoIndexedDb();
   const databases = await indexedDB.databases();
@@ -1134,8 +1150,10 @@ export async function persistCryptoState(stateDir) {
   const target = statePath(stateDir);
   const previous = previousStatePath(stateDir);
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  const previousTemporary = `${previous}.${process.pid}.${randomUUID()}.tmp`;
   const handle = await open(temporary, "wx", 0o600);
   let installed = false;
+  let previousTemporaryExists = false;
   try {
     try {
       await handle.writeFile(payload);
@@ -1143,21 +1161,202 @@ export async function persistCryptoState(stateDir) {
     } finally {
       await handle.close();
     }
-    // Keep one known-good generation. A crash between these renames leaves the
-    // previous generation intact; restoreCryptoState() will use it explicitly.
+    await syncDirectory(stateDir);
+    await onPublicationStep?.("new-snapshot-synced");
+    // Retain the prior generation as forensic evidence without ever removing
+    // the authoritative current snapshot. A hard crash before the final
+    // rename therefore leaves either the old current or the new current, never
+    // a gap that would tempt an unsafe ratchet rollback.
     try {
-      await rename(target, previous);
+      await link(target, previousTemporary);
+      previousTemporaryExists = true;
       await syncDirectory(stateDir);
+      await onPublicationStep?.("previous-candidate-synced");
+      await rename(previousTemporary, previous);
+      previousTemporaryExists = false;
+      await syncDirectory(stateDir);
+      await onPublicationStep?.("previous-installed");
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
     await rename(temporary, target);
     installed = true;
+    await onPublicationStep?.("current-installed");
     await syncDirectory(stateDir);
+    await onPublicationStep?.("current-synced");
     return snapshot.length;
   } finally {
     if (!installed) await rm(temporary, { force: true });
+    if (previousTemporaryExists) await rm(previousTemporary, { force: true });
   }
+}
+
+function deserializeValidatedSnapshot(bytes) {
+  const payload = deserialize(bytes);
+  if (payload?.version !== SNAPSHOT_VERSION || !Array.isArray(payload.databases)) {
+    throw new Error("unsupported snapshot format");
+  }
+  validateSnapshotDatabases(payload.databases);
+  return payload;
+}
+
+async function readValidatedSnapshot(path) {
+  return deserializeValidatedSnapshot(await readFile(path));
+}
+
+export async function validateCurrentCryptoSnapshot(stateDir) {
+  const payload = await readValidatedSnapshot(statePath(stateDir));
+  return { databaseCount: payload.databases.length };
+}
+
+async function assertSecureRegularFile(path, label) {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`Matrix crypto recovery required: ${label} is missing`);
+    }
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error(`Matrix crypto recovery required: ${label} must be a regular file`);
+  }
+  if ((metadata.mode & 0o777) !== 0o600) {
+    throw new Error(`Matrix crypto recovery required: ${label} permissions must be 0600`);
+  }
+  return metadata;
+}
+
+/**
+ * Inspect crash recovery inputs without mutating state. Recovery re-runs every
+ * check while holding the account lock; this result is only an operator aid.
+ */
+export async function inspectCryptoStateRecovery(stateDir) {
+  assertSecureStateDirectory(stateDir);
+  const markerPath = activeRuntimePath(stateDir);
+  const currentPath = statePath(stateDir);
+  await Promise.all([
+    assertSecureRegularFile(markerPath, "active runtime marker"),
+    assertSecureRegularFile(identityPath(stateDir), "identity metadata"),
+    assertSecureRegularFile(currentPath, "current snapshot"),
+  ]);
+  const [marker, identity, snapshotBytes] = await Promise.all([
+    readActiveMarker(
+      markerPath,
+      "Matrix crypto recovery required: the active runtime marker is missing",
+      "Matrix crypto recovery required: the active runtime marker is malformed",
+    ),
+    readCryptoIdentity(stateDir),
+    readFile(currentPath),
+  ]);
+  let snapshot;
+  try {
+    snapshot = deserializeValidatedSnapshot(snapshotBytes);
+  } catch (error) {
+    throw new Error(
+      `Matrix crypto recovery required: current snapshot is invalid: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      { cause: error },
+    );
+  }
+  return {
+    identity,
+    marker: {
+      ...marker,
+      processLive: await isLivePid(marker.pid),
+    },
+    snapshot: {
+      databaseCount: snapshot.databases.length,
+      sha256: createHash("sha256").update(snapshotBytes).digest("hex"),
+    },
+  };
+}
+
+/**
+ * Acknowledge one dead runtime marker after an operator has inspected and
+ * confirmed its exact account/device binding. This never selects or promotes a
+ * previous snapshot.
+ */
+export async function recoverCryptoStateAfterCrash({
+  stateDir,
+  markerToken,
+  expectedIdentity,
+  recoveryOptions = {},
+}) {
+  assertSecureStateDirectory(stateDir);
+  const expected = validateIdentity(expectedIdentity);
+  if (
+    typeof markerToken !== "string"
+    || !OWNERSHIP_TOKEN_PATTERN.test(markerToken)
+  ) {
+    throw new Error("Matrix crypto recovery requires the exact active marker token");
+  }
+  const releaseLock = await acquireCryptoStateLock(stateDir);
+  let outcome;
+  try {
+    const inspected = await inspectCryptoStateRecovery(stateDir);
+    if (inspected.marker.token !== markerToken) {
+      throw new Error("Matrix crypto recovery refused: active marker token does not match");
+    }
+    if (inspected.marker.processLive) {
+      throw new Error(
+        `Matrix crypto recovery refused: marker process ${inspected.marker.pid} is still running`,
+      );
+    }
+    for (const field of ["homeserverUrl", "userId", "deviceId", "accountId"]) {
+      if (inspected.identity[field] !== expected[field]) {
+        throw new Error(
+          `Matrix crypto recovery refused: confirmed ${field} does not match stored identity`,
+        );
+      }
+    }
+
+    const activePath = activeRuntimePath(stateDir);
+    const recoveredPath = `${activePath}.recovered.${markerToken}`;
+    if (await pathExists(recoveredPath)) {
+      throw new Error("Matrix crypto recovery refused: recovered marker evidence already exists");
+    }
+    // The rename is the recovery commit. Everything that can reject has
+    // already run while the active marker still blocked startup. A failed
+    // directory fsync after the atomic rename cannot safely be reported as a
+    // failed recovery, because the active name is already gone; on restart the
+    // filesystem will expose either the old active name or the recovered name.
+    await rename(activePath, recoveredPath);
+    let directorySynced = true;
+    try {
+      await (recoveryOptions.syncDirectoryAfterCommit ?? syncDirectory)(stateDir);
+    } catch {
+      directorySynced = false;
+    }
+    outcome = {
+      ...inspected,
+      recoveredMarkerPath: recoveredPath,
+      directorySynced,
+    };
+  } catch (error) {
+    try {
+      await releaseLock();
+    } catch (releaseError) {
+      throw new AggregateError(
+        [error, releaseError],
+        "Matrix crypto recovery validation failed and its state lock could not be released",
+      );
+    }
+    throw error;
+  }
+  let lockReleased = true;
+  try {
+    await releaseLock();
+  } catch {
+    // Recovery already committed by renaming the active marker. Returning a
+    // failure now would misrepresent startup as still blocked. The stale
+    // recovery-command lock remains fail-closed and can be reclaimed once this
+    // process exits.
+    lockReleased = false;
+  }
+  return { ...outcome, lockReleased };
 }
 
 async function restoreDatabase(snapshot) {
@@ -1198,53 +1397,37 @@ async function restoreDatabase(snapshot) {
 }
 
 export async function restoreCryptoState(stateDir) {
-  const candidates = [
-    { path: statePath(stateDir), generation: "current" },
-    { path: previousStatePath(stateDir), generation: "previous" },
-  ];
-  let lastError = null;
-  for (const candidate of candidates) {
-    let payload;
-    try {
-      payload = deserialize(await readFile(candidate.path));
-      if (payload?.version !== SNAPSHOT_VERSION || !Array.isArray(payload.databases)) {
-        throw new Error("unsupported snapshot format");
-      }
-      validateSnapshotDatabases(payload.databases);
-      for (const database of payload.databases) {
-        await restoreDatabase(database);
-      }
-    } catch (error) {
-      if (error?.code === "ENOENT") continue;
-      lastError = error;
-      try {
-        await clearInMemoryCryptoState();
-      } catch (clearError) {
-        throw new AggregateError(
-          [error, clearError],
-          "Could not clear partially restored Matrix crypto state",
+  let payload;
+  try {
+    payload = await readValidatedSnapshot(statePath(stateDir));
+    for (const database of payload.databases) {
+      await restoreDatabase(database);
+    }
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      if (await pathExists(previousStatePath(stateDir))) {
+        throw new Error(
+          "Could not restore Matrix crypto state: the current snapshot is missing; "
+          + "previous-generation rollback is forbidden and the previous snapshot is forensic evidence only",
         );
       }
-      continue;
+      return false;
     }
-    let rejectedSnapshotPath = null;
-    if (candidate.generation === "previous") {
-      const rejected = rejectedStatePath(stateDir);
-      try {
-        await rename(statePath(stateDir), rejected);
-        rejectedSnapshotPath = rejected;
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
-      }
-      await syncDirectory(stateDir);
+    try {
+      await clearInMemoryCryptoState();
+    } catch (clearError) {
+      throw new AggregateError(
+        [error, clearError],
+        "Could not clear partially restored Matrix crypto state",
+      );
     }
-    return {
-      generation: candidate.generation,
-      rejectedSnapshotPath,
-    };
+    throw new Error(
+      `Could not restore Matrix crypto state: ${error instanceof Error ? error.message : String(error)}; `
+      + "previous-generation rollback is forbidden",
+      { cause: error },
+    );
   }
-  if (!lastError) return false;
-  throw new Error(`Could not restore Matrix crypto state: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+  return { generation: "current" };
 }
 
 export async function clearInMemoryCryptoState() {

@@ -165,20 +165,9 @@ export async function startCryptoRuntime({
     });
     await clearInMemoryCryptoState();
     if (!state.fresh) {
-      const restoredGeneration = await restoreCryptoState(stateDir);
-      if (!restoredGeneration) {
+      const restored = await restoreCryptoState(stateDir);
+      if (!restored) {
         throw new Error("Matrix crypto recovery required: the crypto snapshot could not be restored");
-      }
-      if (restoredGeneration.generation === "previous") {
-        if (restoredGeneration.rejectedSnapshotPath) {
-          console.error(
-            "[matrix] current crypto snapshot was rejected; restored the previous generation and retained the rejected file for recovery",
-          );
-        } else {
-          console.error(
-            "[matrix] current crypto snapshot was missing; restored the previous generation",
-          );
-        }
       }
     }
     activeMarkerToken = await markCryptoStateActive(stateDir);

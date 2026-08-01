@@ -6,11 +6,29 @@ import { startCryptoRuntime } from "./crypto/runtime.mjs";
 const CHANNEL_ID = "matrix";
 const MAX_DEDUPED_EVENT_IDS = 2_000;
 const MAX_TRACKED_THREAD_TIPS = 500;
+const DECRYPTED_EVENT_NAME = "Event.decrypted";
 const WHOAMI_RETRY_DELAYS_MS = [500, 1500];
 const WHOAMI_TIMEOUT_MS = 10_000;
 const TYPING_TIMEOUT_MS = 30_000;
 const TYPING_REFRESH_MS = 10_000;
 const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
+// Numeric values are the pinned SDK's public EventShieldColour/Reason enums.
+const SHIELD_COLOUR = { NONE: 0, GREY: 1, RED: 2 };
+const SHIELD_REASON = {
+  UNKNOWN: 0,
+  UNVERIFIED_IDENTITY: 1,
+  UNSIGNED_DEVICE: 2,
+  AUTHENTICITY_NOT_GUARANTEED: 4,
+};
+const SHIELD_COLOUR_NAMES = ["none", "grey", "red"];
+const SHIELD_REASON_NAMES = [
+  "unknown",
+  "unverified_identity",
+  "unsigned_device",
+  "unknown_device",
+  "authenticity_not_guaranteed",
+  "mismatched_sender_key",
+];
 const CHANNEL_DIR = dirname(fileURLToPath(import.meta.url));
 const STARTUP_CLEANUP_COMPLETE = Symbol("matrix-startup-cleanup-complete");
 // Mirrors Letta Code 0.29.x channel slash commands; unknown "/words" stay agent text.
@@ -21,6 +39,52 @@ const COMMAND_WORDS = new Set([
 
 function nonEmpty(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function safeLogToken(value, fallback = "unknown") {
+  const text = nonEmpty(String(value ?? "")) ?? fallback;
+  return text.replace(/[\u0000-\u001f\u007f\s]+/g, "_").slice(0, 160);
+}
+
+function roomIsEncrypted(room) {
+  return (
+    room?.hasEncryptionStateEvent?.() === true
+    || Boolean(room?.currentState?.getStateEvents?.("m.room.encryption", ""))
+  );
+}
+
+function cryptoWriteAheadRequest(input) {
+  const rawUrl = typeof input === "string" || input instanceof URL
+    ? String(input)
+    : input?.url;
+  if (!rawUrl) return false;
+  let segments;
+  try {
+    segments = new URL(rawUrl).pathname.split("/");
+  } catch {
+    return false;
+  }
+  return segments.some((segment, index) => (
+    (
+      segment === "rooms"
+      && segments[index + 2] === "send"
+      && segments[index + 3] === "m.room.encrypted"
+    )
+    || (
+      segment === "sendToDevice"
+      && segments[index + 1] === "m.room.encrypted"
+    )
+    || (
+      segment === "keys"
+      && segments[index + 1] === "upload"
+    )
+  ));
+}
+
+function shieldLabel(value, labels, fallback) {
+  return typeof value === "number" && labels[value]
+    ? labels[value]
+    : safeLogToken(value, fallback);
 }
 
 function stringList(value) {
@@ -212,6 +276,8 @@ class MatrixChannelAdapter {
     this.account = account;
     this.settings = parseSettings(account);
     this.sdk = loadSdk();
+    this.networkFetch = globalThis.fetch?.bind(globalThis);
+    this.clientFetchToken = null;
     this.client = this.createClient();
     this.id = `${CHANNEL_ID}:${account.accountId}`;
     this.channelId = CHANNEL_ID;
@@ -228,7 +294,8 @@ class MatrixChannelAdapter {
     this.seenEventIds = new Set();
     this.threadTips = new Map();
     this.lastTypingSentAt = new Map();
-    this.warnedEncryptedRooms = new Set();
+    this.warnedEncryptionConditions = new Set();
+    this.encryptedEventContexts = new WeakMap();
     this.cryptoRuntime = null;
     this.pendingRuntimeStop = null;
     this.runtimeCleanupError = null;
@@ -237,13 +304,42 @@ class MatrixChannelAdapter {
     this.acceptedEpoch = null;
     this.syncListener = null;
     this.timelineListener = null;
+    this.decryptedListener = null;
   }
 
   createClient() {
+    const fetchToken = {};
+    this.clientFetchToken = fetchToken;
     return this.sdk.createClient({
       baseUrl: this.settings.homeserverUrl,
       accessToken: this.settings.accessToken,
+      fetchFn: (...args) => this.fetchMatrix(fetchToken, ...args),
     });
+  }
+
+  async fetchMatrix(fetchToken, input, init) {
+    if (cryptoWriteAheadRequest(input)) {
+      const runtime = this.cryptoRuntime;
+      if (
+        fetchToken !== this.clientFetchToken
+        || !this.settings.encryptionEnabled
+        || !runtime
+      ) {
+        throw new Error("refusing stale or uninitialized Matrix encrypted request");
+      }
+      const persisted = await this.checkpointCryptoState("encrypted-request");
+      if (
+        !persisted
+        || fetchToken !== this.clientFetchToken
+        || this.cryptoRuntime !== runtime
+      ) {
+        throw new Error("refusing Matrix encrypted request without a current persisted crypto runtime");
+      }
+    }
+    if (typeof this.networkFetch !== "function") {
+      throw new Error("Matrix network fetch is unavailable");
+    }
+    return await this.networkFetch(input, init);
   }
 
   start() {
@@ -332,8 +428,10 @@ class MatrixChannelAdapter {
     let runtime = null;
     let syncListener = null;
     let timelineListener = null;
+    let decryptedListener = null;
     let syncListenerAttached = false;
     let timelineListenerAttached = false;
+    let decryptedListenerAttached = false;
     let clientMustStop = false;
     let cryptoAttempted = false;
     try {
@@ -375,8 +473,10 @@ class MatrixChannelAdapter {
             runtime,
             syncListener,
             timelineListener,
+            decryptedListener,
             syncListenerAttached,
             timelineListenerAttached,
+            decryptedListenerAttached,
             clientMustStop,
           });
           if (cleanup.errors.length) {
@@ -403,9 +503,7 @@ class MatrixChannelAdapter {
           || normalized === "SYNCING"
         );
         if (this.cryptoRuntime && normalized === "PREPARED") {
-          void this.cryptoRuntime.persist().catch((error) => {
-            console.error(`[${CHANNEL_ID}] crypto persistence checkpoint failed for ${this.accountId}:`, error);
-          });
+          void this.checkpointCryptoState("sync");
         }
       };
       timelineListener = (event, room, toStartOfTimeline, removed, data) => {
@@ -414,11 +512,24 @@ class MatrixChannelAdapter {
           console.error(`[${CHANNEL_ID}] inbound event failed for ${this.accountId}:`, error);
         });
       };
+      decryptedListener = (event, error) => {
+        if (!acceptsEvents()) return;
+        void this.handleEncryptedEventUpdate(event, error).catch((updateError) => {
+          console.error(
+            `[${CHANNEL_ID}] post-decryption event failed for ${safeLogToken(this.accountId)}:`,
+            updateError,
+          );
+        });
+      };
       this.acceptedEpoch = epoch;
       client.on("sync", syncListener);
       syncListenerAttached = true;
       client.on("Room.timeline", timelineListener);
       timelineListenerAttached = true;
+      if (this.settings.encryptionEnabled) {
+        client.on(DECRYPTED_EVENT_NAME, decryptedListener);
+        decryptedListenerAttached = true;
+      }
       clientMustStop = true;
       await client.startClient({ initialSyncLimit: 0 });
       if (epoch !== this.epoch) {
@@ -427,8 +538,10 @@ class MatrixChannelAdapter {
           runtime,
           syncListener,
           timelineListener,
+          decryptedListener,
           syncListenerAttached,
           timelineListenerAttached,
+          decryptedListenerAttached,
           clientMustStop,
         });
         if (cleanup.errors.length) {
@@ -442,6 +555,7 @@ class MatrixChannelAdapter {
       }
       this.syncListener = syncListener;
       this.timelineListener = timelineListener;
+      this.decryptedListener = decryptedListenerAttached ? decryptedListener : null;
       this.running = true;
     } catch (error) {
       if (error?.[STARTUP_CLEANUP_COMPLETE]) throw error;
@@ -450,8 +564,10 @@ class MatrixChannelAdapter {
         runtime,
         syncListener,
         timelineListener,
+        decryptedListener,
         syncListenerAttached,
         timelineListenerAttached,
+        decryptedListenerAttached,
         clientMustStop: (
           clientMustStop
           || (cryptoAttempted && error?.matrixCryptoClientStopHandled !== true)
@@ -484,11 +600,14 @@ class MatrixChannelAdapter {
     runtime,
     syncListener,
     timelineListener,
+    decryptedListener,
     syncListenerAttached,
     timelineListenerAttached,
+    decryptedListenerAttached,
     clientMustStop,
   }) {
     this.acceptedEpoch = null;
+    this.clearEncryptedEventContexts();
     const errors = [];
     let permanent = false;
     if (syncListenerAttached) {
@@ -502,6 +621,14 @@ class MatrixChannelAdapter {
     if (timelineListenerAttached) {
       try {
         client.removeListener("Room.timeline", timelineListener);
+      } catch (error) {
+        errors.push(error);
+        permanent = true;
+      }
+    }
+    if (decryptedListenerAttached) {
+      try {
+        client.removeListener(DECRYPTED_EVENT_NAME, decryptedListener);
       } catch (error) {
         errors.push(error);
         permanent = true;
@@ -535,6 +662,7 @@ class MatrixChannelAdapter {
     }
     if (this.syncListener === syncListener) this.syncListener = null;
     if (this.timelineListener === timelineListener) this.timelineListener = null;
+    if (this.decryptedListener === decryptedListener) this.decryptedListener = null;
     if (this.cryptoRuntime === runtime) this.cryptoRuntime = null;
     this.running = false;
     this.initialSyncComplete = false;
@@ -562,13 +690,16 @@ class MatrixChannelAdapter {
     const runtime = this.cryptoRuntime;
     const syncListener = this.syncListener;
     const timelineListener = this.timelineListener;
+    const decryptedListener = this.decryptedListener;
     this.cryptoRuntime = null;
     this.syncListener = null;
     this.timelineListener = null;
+    this.decryptedListener = null;
     this.acceptedEpoch = null;
     this.running = false;
     this.initialSyncComplete = false;
     this.outboundRoomStateFresh = false;
+    this.clearEncryptedEventContexts();
     const errors = [];
     let permanent = false;
     if (syncListener) {
@@ -582,6 +713,14 @@ class MatrixChannelAdapter {
     if (timelineListener) {
       try {
         this.client.removeListener("Room.timeline", timelineListener);
+      } catch (error) {
+        errors.push(error);
+        permanent = true;
+      }
+    }
+    if (decryptedListener) {
+      try {
+        this.client.removeListener(DECRYPTED_EVENT_NAME, decryptedListener);
       } catch (error) {
         errors.push(error);
         permanent = true;
@@ -652,7 +791,7 @@ class MatrixChannelAdapter {
     if (!this.settings.allowedRooms.has(chatId)) return;
     if (!this.initialSyncComplete || !this.outboundRoomStateFresh) return;
     const room = this.client.getRoom?.(chatId);
-    if (!room || room.currentState?.getStateEvents?.("m.room.encryption", "")) return;
+    if (!room || roomIsEncrypted(room)) return;
     const content = { "m.relates_to": { rel_type: "m.annotation", event_id: targetEventId, key } };
     void Promise.resolve(this.client.sendEvent(chatId, "m.reaction", content)).catch(() => {});
   }
@@ -691,7 +830,157 @@ class MatrixChannelAdapter {
     }
   }
 
+  clearEncryptedEventContexts() {
+    this.encryptedEventContexts = new WeakMap();
+  }
+
+  reportDecryptionFailure(event, observer, error) {
+    const reason = safeLogToken(
+      event?.decryptionFailureReason ?? error?.code,
+      "UNKNOWN_ERROR",
+    );
+    if (observer.reportedReasons.has(reason)) return;
+    observer.reportedReasons.add(reason);
+    const status = (
+      reason === "MEGOLM_UNKNOWN_INBOUND_SESSION_ID"
+      || reason === "OLM_UNKNOWN_MESSAGE_INDEX"
+    )
+      ? "missing_key; waiting for SDK key updates"
+      : reason === "MEGOLM_KEY_WITHHELD"
+        || reason === "MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE"
+        ? "withheld; no adapter retry"
+        : "terminal; no adapter retry";
+    console.warn(
+      `[${CHANNEL_ID}] E2EE decryption failed account=${safeLogToken(this.accountId)}`
+      + ` room=${safeLogToken(observer.chatId)} event=${safeLogToken(observer.eventId)}`
+      + ` reason=${reason} status=${status}`,
+    );
+  }
+
+  observeEncryptedEvent(event, context) {
+    let observer = this.encryptedEventContexts.get(event);
+    if (!observer) {
+      observer = {
+        ...context,
+        eventId: nonEmpty(get(event, "getId", "event_id")),
+        reportedReasons: new Set(),
+      };
+      this.encryptedEventContexts.set(event, observer);
+    }
+    if (event?.isDecryptionFailure?.()) {
+      this.reportDecryptionFailure(event, observer);
+    }
+  }
+
+  async handleEncryptedEventUpdate(event, error) {
+    const observer = this.encryptedEventContexts.get(event);
+    if (!observer) return;
+    if (
+      this.acceptedEpoch !== observer.epoch
+      || this.client !== observer.client
+    ) {
+      this.encryptedEventContexts.delete(event);
+      return;
+    }
+    if (error || event?.isDecryptionFailure?.()) {
+      this.reportDecryptionFailure(event, observer, error);
+      return;
+    }
+    this.encryptedEventContexts.delete(event);
+    await this.handleTimelineEvent(
+      event,
+      observer.room,
+      observer.toStartOfTimeline,
+      observer.removed,
+      observer.data,
+    );
+  }
+
+  async recordEncryptionTelemetry(event, chatId) {
+    let info = null;
+    let semantics = "lax";
+    try {
+      const crypto = this.client.getCrypto?.();
+      if (typeof crypto?.getEncryptionInfoForEvent === "function") {
+        info = await crypto.getEncryptionInfoForEvent(event);
+      }
+      if (info && typeof crypto?.getUserVerificationStatus === "function") {
+        const verification = await crypto.getUserVerificationStatus(event.getSender());
+        const unverified = verification?.isVerified?.() === false;
+        const previouslyVerified = (
+          verification?.wasCrossSigningVerified?.() === true
+          || verification?.needsUserApproval === true
+        );
+        if (info.shieldColour === SHIELD_COLOUR.NONE && unverified) {
+          info = {
+            shieldColour: SHIELD_COLOUR.RED,
+            shieldReason: SHIELD_REASON.UNVERIFIED_IDENTITY,
+          };
+        } else if (
+          info.shieldColour === SHIELD_COLOUR.GREY
+          && info.shieldReason === SHIELD_REASON.AUTHENTICITY_NOT_GUARANTEED
+        ) {
+          info = {
+            shieldColour: SHIELD_COLOUR.RED,
+            shieldReason: SHIELD_REASON.AUTHENTICITY_NOT_GUARANTEED,
+          };
+        } else if (info.shieldReason === SHIELD_REASON.UNSIGNED_DEVICE) {
+          info = {
+            shieldColour: SHIELD_COLOUR.RED,
+            shieldReason: SHIELD_REASON.UNVERIFIED_IDENTITY,
+          };
+        } else if (
+          info.shieldReason === SHIELD_REASON.UNKNOWN
+          && previouslyVerified
+        ) {
+          info = {
+            shieldColour: SHIELD_COLOUR.RED,
+            shieldReason: SHIELD_REASON.UNVERIFIED_IDENTITY,
+          };
+        }
+        semantics = "strict";
+      }
+    } catch {
+      console.warn(
+        `[${CHANNEL_ID}] E2EE shield lookup failed account=${safeLogToken(this.accountId)}`
+        + ` room=${safeLogToken(chatId)} event=${safeLogToken(get(event, "getId", "event_id"))}`,
+      );
+      return;
+    }
+    console.info(
+      `[${CHANNEL_ID}] E2EE shield account=${safeLogToken(this.accountId)}`
+      + ` room=${safeLogToken(chatId)} event=${safeLogToken(get(event, "getId", "event_id"))}`
+      + ` semantics=${semantics}`
+      + ` colour=${shieldLabel(info?.shieldColour, SHIELD_COLOUR_NAMES, "unavailable")}`
+      + ` reason=${shieldLabel(
+        info?.shieldReason,
+        SHIELD_REASON_NAMES,
+        "none",
+      )}`,
+    );
+  }
+
+  async checkpointCryptoState(reason) {
+    const runtime = this.cryptoRuntime;
+    if (!this.settings.encryptionEnabled || !runtime) return true;
+    try {
+      await runtime.persist();
+      return true;
+    } catch (error) {
+      if (this.cryptoRuntime !== runtime) return false;
+      console.error(
+        `[${CHANNEL_ID}] crypto persistence checkpoint failed`
+        + ` account=${safeLogToken(this.accountId)} reason=${safeLogToken(reason)};`
+        + " the current crypto barrier failed:",
+        error,
+      );
+      return false;
+    }
+  }
+
   async handleTimelineEvent(event, room, toStartOfTimeline, removed, data) {
+    const eventEpoch = this.acceptedEpoch;
+    const eventClient = this.client;
     if (!this.initialSyncComplete) return;
     if (toStartOfTimeline || removed || !data?.liveEvent) return;
     const chatId = nonEmpty(room?.roomId ?? room?.room_id);
@@ -703,17 +992,51 @@ class MatrixChannelAdapter {
         ? event.getWireType()
         : event?.event?.type ?? type
     );
-    if (wireType === "m.room.encrypted" || type === "m.room.encrypted") {
-      if (!this.warnedEncryptedRooms.has(chatId)) {
-        this.warnedEncryptedRooms.add(chatId);
-        console.warn(`[${CHANNEL_ID}] ignoring E2EE event in ${chatId}; post-decryption delivery is not implemented`);
+    const senderId = nonEmpty(get(event, "getSender", "sender"));
+    if (!senderId || senderId === this.selfUserId || !this.settings.allowedUsers.has(senderId)) return;
+
+    const encryptedRoom = roomIsEncrypted(room);
+    const encryptedWireEvent = wireType === "m.room.encrypted";
+    if (encryptedWireEvent && !this.settings.encryptionEnabled) {
+      const warningKey = `disabled:${chatId}`;
+      if (!this.warnedEncryptionConditions.has(warningKey)) {
+        this.warnedEncryptionConditions.add(warningKey);
+        console.warn(`[${CHANNEL_ID}] ignoring E2EE event in ${chatId}; encryption is disabled`);
       }
       return;
     }
+    if (encryptedWireEvent !== encryptedRoom) {
+      const warningKey = `mismatch:${chatId}`;
+      if (!this.warnedEncryptionConditions.has(warningKey)) {
+        this.warnedEncryptionConditions.add(warningKey);
+        console.warn(
+          `[${CHANNEL_ID}] ignoring Matrix room/wire encryption mismatch`
+          + ` account=${safeLogToken(this.accountId)} room=${safeLogToken(chatId)}`
+          + ` event=${safeLogToken(get(event, "getId", "event_id"))}`,
+        );
+      }
+      return;
+    }
+    if (
+      encryptedWireEvent
+      && (
+        type === "m.room.encrypted"
+        || event?.isDecryptionFailure?.()
+      )
+    ) {
+      this.observeEncryptedEvent(event, {
+        chatId,
+        room,
+        toStartOfTimeline,
+        removed,
+        data,
+        epoch: this.acceptedEpoch,
+        client: this.client,
+      });
+      return;
+    }
+    if (type === "m.room.encrypted") return;
     if (type !== "m.room.message") return;
-
-    const senderId = nonEmpty(get(event, "getSender", "sender"));
-    if (!senderId || senderId === this.selfUserId || !this.settings.allowedUsers.has(senderId)) return;
 
     const content = get(event, "getContent", "content") ?? {};
     const relation = content["m.relates_to"];
@@ -732,6 +1055,29 @@ class MatrixChannelAdapter {
 
     const messageId = nonEmpty(get(event, "getId", "event_id"));
     if (!this.remember(messageId)) return;
+    if (encryptedWireEvent) {
+      this.encryptedEventContexts.delete(event);
+      await this.recordEncryptionTelemetry(event, chatId);
+      if (
+        this.acceptedEpoch !== eventEpoch
+        || this.client !== eventClient
+        || !this.initialSyncComplete
+      ) {
+        this.seenEventIds.delete(messageId);
+        return;
+      }
+      const persisted = await this.checkpointCryptoState("decrypted-event");
+      if (
+        !persisted
+        ||
+        this.acceptedEpoch !== eventEpoch
+        || this.client !== eventClient
+        || !this.initialSyncComplete
+      ) {
+        this.seenEventIds.delete(messageId);
+        return;
+      }
+    }
     const threadId = relation?.rel_type === "m.thread" && typeof relation.event_id === "string"
       ? relation.event_id
       : undefined;
@@ -789,8 +1135,12 @@ class MatrixChannelAdapter {
     if (!room) {
       throw new Error(`refusing Matrix outbound without loaded room state for ${chatId}`);
     }
-    if (room?.currentState?.getStateEvents?.("m.room.encryption", "")) {
+    const encryptedRoom = roomIsEncrypted(room);
+    if (encryptedRoom && !this.settings.encryptionEnabled) {
       throw new Error(`refusing to send plaintext into encrypted Matrix room ${chatId}`);
+    }
+    if (encryptedRoom && !this.client.getCrypto?.()) {
+      throw new Error(`refusing Matrix encrypted outbound without initialized crypto for ${chatId}`);
     }
 
     const threadId = nonEmpty(message.threadId);
