@@ -21,22 +21,39 @@ the same within a smaller Letta-oriented boundary.
 3. The pinned Matrix SDK has process-global Rust-crypto IndexedDB names. v1
    therefore permits **one encrypted Matrix account per listener process**.
    A second encrypted account fails at startup rather than sharing state.
+   Snapshot, restore, and clear operations are restricted to the pinned SDK's
+   two crypto database names and validate its expected schema and Olm account.
 4. The crypto state directory is exclusive to one account. A crash-safe
-   PID/liveness lock prevents concurrent use; state is mode `0700`, snapshots
-   mode `0600`.
+   PID/liveness lock prevents concurrent use, and a separate transition gate
+   serializes stale-owner replacement, publication, and release. State is mode
+   `0700`; snapshots and identity metadata are mode `0600`.
+   The state directory must be host-local; shared or network-mounted crypto
+   state is unsupported because PID liveness has only host-local meaning.
+   The gate is deliberately not auto-reclaimed after its owner dies: deleting
+   the serialization primitive after a stale read could delete a live
+   successor's gate and reintroduce the takeover race. Live contention reports
+   the owning PID and asks the caller to retry; a dead or malformed transition
+   gate fails closed for operator recovery.
 5. State persistence serializes binary IndexedDB records without JSON loss,
-   retains a previous known-good generation, and uses atomic replacement.
-6. An encrypted outbound message is allowed only after initial sync has loaded
-   its room encryption state and crypto startup completed.
+   retains a previous known-good generation, uses one readonly transaction per
+   crypto database plus atomic file replacement, and serializes periodic,
+   explicit-barrier, and shutdown checkpoints.
+6. Outbound messages are allowed only after initial sync has loaded room
+   encryption state and while the SDK reports that state as current. Any
+   reconnect, catch-up, stopped, or error state closes the outbound gate until
+   sync is current again.
 7. Undecryptable events never become fake plaintext. They get bounded handling
    and a safe operator diagnostic containing IDs/reason only.
 
 ## Device and recovery model
 
-The first encrypted startup creates or restores the bot's Matrix device. The
-adapter records the bot user ID and device ID beside its crypto state, verifies
-that they match before restore, and logs the device ID locally for manual
-verification in an existing Matrix client.
+The first encrypted startup creates or restores the bot's Matrix device. A
+first bootstrap is allowed only when the runtime itself creates the state
+directory; a pre-existing empty directory is treated as suspicious. The
+adapter records the homeserver, channel account ID, bot user ID, and device ID
+beside its crypto state and verifies that they match before restore. The
+default directory is durable `channel/state/<account>`, and configured relative
+paths are resolved from `channel/`, not the listener's process directory.
 
 Cross-signing bootstrap, recovery-key upload, and automatic trust repair are
 not v1 features. If state is missing or identity metadata does not match, the
@@ -48,15 +65,40 @@ device over an existing state directory.
 ### Phase 1 — persistence primitives
 
 `channel/crypto/idb-state.mjs` is the first adapted module. It provides binary
-snapshot/restore and account-state locking. It is independently tested, but is
-**not integrated into the adapter yet** and does not mean E2EE is supported.
+snapshot/restore and account-state locking. It is independently tested and
+used by the phase-2 runtime, but does not by itself mean E2EE is supported.
 
 ### Phase 2 — crypto runtime and adapter lifecycle
 
 Install the fake IndexedDB runtime, enforce single encrypted-account ownership,
 restore state, initialize Rust crypto before sync, and snapshot at startup,
-clean stop, and sync/key-processing barriers. A crash must not roll back a
-ratchet or reuse an outbound Megolm message index.
+periodically, on clean stop, and at exposed sync/key-processing barriers.
+
+These checkpoints reduce the amount of state exposed to a process crash; they
+do not yet prove crash consistency. Previous-generation recovery can roll state
+back, and fake-IndexedDB snapshots cannot transact across both crypto
+databases. Ratchet and outbound Megolm-index safety remain real encrypted-room
+crash/restart test requirements before E2EE support can be claimed.
+
+Clean shutdown advances through a final snapshot, owned active-marker removal,
+filesystem-lock release, and process-guard release. Each destructive step
+records its completed phase, so a transient filesystem failure can be retried
+without repeating Matrix client shutdown or touching a successor's lock. Until
+the retry completes, startup stays blocked and ownership remains held.
+Ownership loss, malformed metadata, and dead transition gates are not
+advertised as retryable: they permanently quarantine encrypted startup in that
+process and require operator recovery.
+
+Until those tests exist, a runtime-active marker makes an unclean process exit
+fail closed on the next startup instead of automatically restoring a possibly
+stale ratchet snapshot. Operator-guided recovery for that marker is intentionally
+not part of this lifecycle slice. If Rust initialization rejects, the mandatory
+first snapshot fails, an IndexedDB delete is blocked, or Matrix client shutdown
+cannot be proven, the interval timer is stopped but the marker, filesystem
+lock, and process guard remain quarantined until process exit.
+
+Phase 2 still drops encrypted timeline events and refuses sends to encrypted
+rooms. Phase 3 and the real-room gate must land before either path is enabled.
 
 ### Phase 3 — decryption and trust policy
 

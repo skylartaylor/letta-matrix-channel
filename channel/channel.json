@@ -2,6 +2,10 @@
   "id": "matrix",
   "displayName": "Matrix",
   "entry": "./plugin.mjs",
-  "runtimePackages": ["matrix-js-sdk@34.11.1", "fake-indexeddb@6.2.5"],
+  "runtimePackages": [
+    "matrix-js-sdk@34.11.1",
+    "@matrix-org/matrix-sdk-crypto-wasm@9.1.0",
+    "fake-indexeddb@6.2.5"
+  ],
   "runtimeModules": ["matrix-js-sdk", "fake-indexeddb"]
 }

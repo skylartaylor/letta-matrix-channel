@@ -1,4 +1,7 @@
 import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { startCryptoRuntime } from "./crypto/runtime.mjs";
 
 const CHANNEL_ID = "matrix";
 const MAX_DEDUPED_EVENT_IDS = 2_000;
@@ -8,6 +11,8 @@ const WHOAMI_TIMEOUT_MS = 10_000;
 const TYPING_TIMEOUT_MS = 30_000;
 const TYPING_REFRESH_MS = 10_000;
 const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
+const CHANNEL_DIR = dirname(fileURLToPath(import.meta.url));
+const STARTUP_CLEANUP_COMPLETE = Symbol("matrix-startup-cleanup-complete");
 // Mirrors Letta Code 0.29.x channel slash commands; unknown "/words" stay agent text.
 const COMMAND_WORDS = new Set([
   "help", "status", "whoami", "cancel", "chat", "detach", "model", "new",
@@ -32,6 +37,20 @@ function loadSdk() {
   // Custom-channel packages are installed under runtime/, not this project.
   const require = createRequire(new URL("./runtime/package.json", import.meta.url));
   return require("matrix-js-sdk");
+}
+
+function stateAccountComponent(accountId) {
+  const value = String(accountId ?? "");
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && value !== "." && value !== "..") {
+    return value;
+  }
+  return `~${Buffer.from(value).toString("base64url") || "empty"}`;
+}
+
+function cryptoStateDirectory(accountId, configuredStateDir) {
+  return configuredStateDir
+    ? resolve(CHANNEL_DIR, configuredStateDir)
+    : resolve(CHANNEL_DIR, "state", stateAccountComponent(accountId));
 }
 
 function parseSettings(account) {
@@ -73,6 +92,8 @@ function parseSettings(account) {
     whoamiRetryDelaysMs: Array.isArray(config.whoamiRetryDelaysMs)
       ? config.whoamiRetryDelaysMs.filter((ms) => typeof ms === "number" && ms >= 0)
       : WHOAMI_RETRY_DELAYS_MS,
+    encryptionEnabled: config.encryption?.enabled === true,
+    encryptionStateDir: typeof config.encryption?.stateDir === "string" ? config.encryption.stateDir.trim() : null,
   };
 }
 
@@ -190,40 +211,133 @@ class MatrixChannelAdapter {
   constructor(account) {
     this.account = account;
     this.settings = parseSettings(account);
-    this.client = loadSdk().createClient({
-      baseUrl: this.settings.homeserverUrl,
-      accessToken: this.settings.accessToken,
-    });
+    this.sdk = loadSdk();
+    this.client = this.createClient();
     this.id = `${CHANNEL_ID}:${account.accountId}`;
     this.channelId = CHANNEL_ID;
     this.accountId = account.accountId;
     this.name = account.displayName ?? "Matrix";
     this.onMessage = undefined;
     this.running = false;
-    this.startPending = false;
+    this.desiredRunning = false;
+    this.lifecyclePromise = null;
     this.epoch = 0;
     this.initialSyncComplete = false;
+    this.outboundRoomStateFresh = false;
     this.selfUserId = null;
     this.seenEventIds = new Set();
     this.threadTips = new Map();
     this.lastTypingSentAt = new Map();
     this.warnedEncryptedRooms = new Set();
-    // Bound once: the host reuses this instance across stop()/start() cycles.
-    this.onSync = (state) => {
-      if (String(state).toUpperCase() === "PREPARED") this.initialSyncComplete = true;
-    };
-    this.onTimeline = (event, room, toStartOfTimeline, removed, data) =>
-      this.handleTimelineEvent(event, room, toStartOfTimeline, removed, data).catch((error) => {
-        console.error(`[${CHANNEL_ID}] inbound event failed for ${this.accountId}:`, error);
-      });
+    this.cryptoRuntime = null;
+    this.pendingRuntimeStop = null;
+    this.runtimeCleanupError = null;
+    this.encryptedClientConsumed = false;
+    this.lifecycleCleanupError = null;
+    this.acceptedEpoch = null;
+    this.syncListener = null;
+    this.timelineListener = null;
   }
 
-  async start() {
-    if (this.running || this.startPending) return;
-    this.startPending = true;
+  createClient() {
+    return this.sdk.createClient({
+      baseUrl: this.settings.homeserverUrl,
+      accessToken: this.settings.accessToken,
+    });
+  }
+
+  start() {
+    if (this.pendingRuntimeStop) {
+      return Promise.reject(new Error(
+        "Matrix encrypted adapter cleanup is still pending; call stop() again before restart",
+        { cause: this.runtimeCleanupError },
+      ));
+    }
+    if (this.lifecycleCleanupError) {
+      return Promise.reject(new Error(
+        this.settings.encryptionEnabled
+          ? "Matrix encrypted adapter cannot restart after failed lifecycle cleanup; recreate the adapter"
+          : "Matrix adapter cannot restart after failed lifecycle cleanup; recreate the adapter",
+        { cause: this.lifecycleCleanupError },
+      ));
+    }
+    this.desiredRunning = true;
+    if (this.running && !this.lifecyclePromise) return Promise.resolve();
+    return this.reconcileLifecycle();
+  }
+
+  stop() {
+    this.desiredRunning = false;
+    this.epoch += 1;
+    this.acceptedEpoch = null;
+    this.initialSyncComplete = false;
+    this.outboundRoomStateFresh = false;
+    if (
+      !this.lifecyclePromise
+      && !this.running
+      && !this.cryptoRuntime
+      && !this.pendingRuntimeStop
+    ) {
+      return Promise.resolve();
+    }
+    return this.reconcileLifecycle().catch((error) => {
+      if (
+        !this.desiredRunning
+        && !this.running
+        && !this.cryptoRuntime
+        && !this.pendingRuntimeStop
+        && !this.lifecycleCleanupError
+      ) {
+        return;
+      }
+      throw error;
+    });
+  }
+
+  reconcileLifecycle() {
+    if (this.lifecyclePromise) return this.lifecyclePromise;
+    const operation = (async () => {
+      while (true) {
+        if (this.desiredRunning) {
+          if (!this.running) await this.performStart();
+        } else if (this.running || this.cryptoRuntime || this.pendingRuntimeStop) {
+          await this.performStop();
+        }
+
+        const settled = this.desiredRunning
+          ? this.running
+          : !this.running && !this.cryptoRuntime && !this.pendingRuntimeStop;
+        if (settled) return;
+      }
+    })();
+    this.lifecyclePromise = operation;
+    void operation.then(
+      () => {
+        if (this.lifecyclePromise === operation) this.lifecyclePromise = null;
+      },
+      () => {
+        if (this.lifecyclePromise === operation) this.lifecyclePromise = null;
+      },
+    );
+    return operation;
+  }
+
+  async performStart() {
+    if (this.settings.encryptionEnabled && this.encryptedClientConsumed) {
+      this.client = this.createClient();
+      this.encryptedClientConsumed = false;
+    }
+    const client = this.client;
     const epoch = ++this.epoch;
+    let runtime = null;
+    let syncListener = null;
+    let timelineListener = null;
+    let syncListenerAttached = false;
+    let timelineListenerAttached = false;
+    let clientMustStop = false;
+    let cryptoAttempted = false;
     try {
-      const identity = await whoamiWithRetry(this.client, this.settings);
+      const identity = await whoamiWithRetry(client, this.settings);
       const selfUserId = nonEmpty(identity?.user_id);
       if (!selfUserId) throw new Error("Matrix whoami returned no user_id; check the configured bot_token");
       // stop() during the whoami round-trip abandons this start.
@@ -231,24 +345,279 @@ class MatrixChannelAdapter {
       this.selfUserId = selfUserId;
       // createClient() without userId never resolves one; SDK internals (sync filter
       // name, Room.myUserId) read credentials.userId and must be set before startClient.
-      (this.client.credentials ??= {}).userId = selfUserId;
-      this.client.on("sync", this.onSync);
-      this.client.on("Room.timeline", this.onTimeline);
-      this.client.startClient({ initialSyncLimit: 0 });
+      (client.credentials ??= {}).userId = selfUserId;
+      if (this.settings.encryptionEnabled) {
+        const deviceId = nonEmpty(identity?.device_id);
+        if (!deviceId) throw new Error("Matrix whoami returned no device_id; encrypted mode requires a stable Matrix device");
+        client.deviceId = deviceId;
+        (client.credentials ??= {}).deviceId = deviceId;
+        if (typeof client.initRustCrypto !== "function") {
+          throw new Error("Matrix Rust crypto is unavailable in this channel runtime");
+        }
+        cryptoAttempted = true;
+        this.encryptedClientConsumed = true;
+        const homeserverUrl = new URL(this.settings.homeserverUrl).href;
+        runtime = await startCryptoRuntime({
+          client,
+          accountKey: `${homeserverUrl}\u0000${selfUserId}\u0000${this.accountId}`,
+          stateDir: cryptoStateDirectory(this.accountId, this.settings.encryptionStateDir),
+          identity: {
+            homeserverUrl,
+            userId: selfUserId,
+            deviceId,
+            accountId: String(this.accountId),
+          },
+        });
+        clientMustStop = true;
+        if (epoch !== this.epoch) {
+          const cleanup = await this.cleanupClientStart({
+            client,
+            runtime,
+            syncListener,
+            timelineListener,
+            syncListenerAttached,
+            timelineListenerAttached,
+            clientMustStop,
+          });
+          if (cleanup.errors.length) {
+            throw this.lifecycleCleanupFailure(
+              cleanup.errors,
+              "Matrix cancelled startup cleanup failed",
+              { permanent: cleanup.permanent },
+            );
+          }
+          return;
+        }
+        this.cryptoRuntime = runtime;
+      }
+      const acceptsEvents = () => (
+        this.acceptedEpoch === epoch
+        && this.client === client
+      );
+      syncListener = (state) => {
+        if (!acceptsEvents()) return;
+        const normalized = String(state).toUpperCase();
+        if (normalized === "PREPARED") this.initialSyncComplete = true;
+        this.outboundRoomStateFresh = (
+          normalized === "PREPARED"
+          || normalized === "SYNCING"
+        );
+        if (this.cryptoRuntime && normalized === "PREPARED") {
+          void this.cryptoRuntime.persist().catch((error) => {
+            console.error(`[${CHANNEL_ID}] crypto persistence checkpoint failed for ${this.accountId}:`, error);
+          });
+        }
+      };
+      timelineListener = (event, room, toStartOfTimeline, removed, data) => {
+        if (!acceptsEvents()) return;
+        void this.handleTimelineEvent(event, room, toStartOfTimeline, removed, data).catch((error) => {
+          console.error(`[${CHANNEL_ID}] inbound event failed for ${this.accountId}:`, error);
+        });
+      };
+      this.acceptedEpoch = epoch;
+      client.on("sync", syncListener);
+      syncListenerAttached = true;
+      client.on("Room.timeline", timelineListener);
+      timelineListenerAttached = true;
+      clientMustStop = true;
+      await client.startClient({ initialSyncLimit: 0 });
+      if (epoch !== this.epoch) {
+        const cleanup = await this.cleanupClientStart({
+          client,
+          runtime,
+          syncListener,
+          timelineListener,
+          syncListenerAttached,
+          timelineListenerAttached,
+          clientMustStop,
+        });
+        if (cleanup.errors.length) {
+          throw this.lifecycleCleanupFailure(
+            cleanup.errors,
+            "Matrix cancelled startup cleanup failed",
+            { permanent: cleanup.permanent },
+          );
+        }
+        return;
+      }
+      this.syncListener = syncListener;
+      this.timelineListener = timelineListener;
       this.running = true;
-    } finally {
-      this.startPending = false;
+    } catch (error) {
+      if (error?.[STARTUP_CLEANUP_COMPLETE]) throw error;
+      const cleanup = await this.cleanupClientStart({
+        client,
+        runtime,
+        syncListener,
+        timelineListener,
+        syncListenerAttached,
+        timelineListenerAttached,
+        clientMustStop: (
+          clientMustStop
+          || (cryptoAttempted && error?.matrixCryptoClientStopHandled !== true)
+        ),
+      });
+      if (cleanup.errors.length) {
+        const failure = new AggregateError(
+          [error, ...cleanup.errors],
+          `${error instanceof Error ? error.message : String(error)}; Matrix startup cleanup also failed`,
+        );
+        if (cleanup.permanent) this.lifecycleCleanupError = failure;
+        throw failure;
+      }
+      if (error?.matrixCryptoProcessQuarantined === true) {
+        this.lifecycleCleanupError = error;
+      }
+      throw error;
     }
   }
 
-  async stop() {
-    this.epoch += 1;
-    if (!this.running) return;
-    this.client.removeListener("sync", this.onSync);
-    this.client.removeListener("Room.timeline", this.onTimeline);
-    this.client.stopClient();
+  lifecycleCleanupFailure(errors, message, { permanent = true } = {}) {
+    const failure = new AggregateError(errors, message);
+    failure[STARTUP_CLEANUP_COMPLETE] = true;
+    if (permanent) this.lifecycleCleanupError = failure;
+    return failure;
+  }
+
+  async cleanupClientStart({
+    client,
+    runtime,
+    syncListener,
+    timelineListener,
+    syncListenerAttached,
+    timelineListenerAttached,
+    clientMustStop,
+  }) {
+    this.acceptedEpoch = null;
+    const errors = [];
+    let permanent = false;
+    if (syncListenerAttached) {
+      try {
+        client.removeListener("sync", syncListener);
+      } catch (error) {
+        errors.push(error);
+        permanent = true;
+      }
+    }
+    if (timelineListenerAttached) {
+      try {
+        client.removeListener("Room.timeline", timelineListener);
+      } catch (error) {
+        errors.push(error);
+        permanent = true;
+      }
+    }
+    let clientStopFailed = false;
+    if (clientMustStop) {
+      try {
+        await client.stopClient();
+      } catch (error) {
+        clientStopFailed = true;
+        errors.push(error);
+        permanent = true;
+      }
+    }
+    try {
+      if (clientStopFailed) await runtime?.quarantine();
+      else await runtime?.stop();
+    } catch (error) {
+      errors.push(error);
+      if (
+        !clientStopFailed
+        && runtime
+        && error?.matrixCryptoRuntimeStopRetryable === true
+      ) {
+        this.pendingRuntimeStop = runtime;
+        this.runtimeCleanupError = error;
+      } else {
+        permanent = true;
+      }
+    }
+    if (this.syncListener === syncListener) this.syncListener = null;
+    if (this.timelineListener === timelineListener) this.timelineListener = null;
+    if (this.cryptoRuntime === runtime) this.cryptoRuntime = null;
     this.running = false;
     this.initialSyncComplete = false;
+    this.outboundRoomStateFresh = false;
+    return { errors, permanent };
+  }
+
+  async performStop() {
+    if (this.pendingRuntimeStop) {
+      const runtime = this.pendingRuntimeStop;
+      try {
+        await runtime.stop();
+      } catch (error) {
+        this.runtimeCleanupError = error;
+        if (error?.matrixCryptoRuntimeStopRetryable !== true) {
+          if (this.pendingRuntimeStop === runtime) this.pendingRuntimeStop = null;
+          this.lifecycleCleanupError = error;
+        }
+        throw error;
+      }
+      if (this.pendingRuntimeStop === runtime) this.pendingRuntimeStop = null;
+      this.runtimeCleanupError = null;
+      return;
+    }
+    const runtime = this.cryptoRuntime;
+    const syncListener = this.syncListener;
+    const timelineListener = this.timelineListener;
+    this.cryptoRuntime = null;
+    this.syncListener = null;
+    this.timelineListener = null;
+    this.acceptedEpoch = null;
+    this.running = false;
+    this.initialSyncComplete = false;
+    this.outboundRoomStateFresh = false;
+    const errors = [];
+    let permanent = false;
+    if (syncListener) {
+      try {
+        this.client.removeListener("sync", syncListener);
+      } catch (error) {
+        errors.push(error);
+        permanent = true;
+      }
+    }
+    if (timelineListener) {
+      try {
+        this.client.removeListener("Room.timeline", timelineListener);
+      } catch (error) {
+        errors.push(error);
+        permanent = true;
+      }
+    }
+    let clientStopFailed = false;
+    try {
+      await this.client.stopClient();
+    } catch (error) {
+      clientStopFailed = true;
+      errors.push(error);
+      permanent = true;
+    }
+    try {
+      if (clientStopFailed) await runtime?.quarantine();
+      else await runtime?.stop();
+    } catch (error) {
+      errors.push(error);
+      if (
+        !clientStopFailed
+        && runtime
+        && error?.matrixCryptoRuntimeStopRetryable === true
+      ) {
+        this.pendingRuntimeStop = runtime;
+        this.runtimeCleanupError = error;
+      } else {
+        permanent = true;
+      }
+    }
+    if (errors.length) {
+      const failure = errors.length === 1
+        ? errors[0]
+        : new AggregateError(errors, "Matrix client lifecycle cleanup failed");
+      if (permanent) this.lifecycleCleanupError = failure;
+      throw failure;
+    }
   }
 
   isRunning() {
@@ -281,6 +650,9 @@ class MatrixChannelAdapter {
   react(chatId, targetEventId, key) {
     if (!this.settings.ackReaction || !targetEventId) return;
     if (!this.settings.allowedRooms.has(chatId)) return;
+    if (!this.initialSyncComplete || !this.outboundRoomStateFresh) return;
+    const room = this.client.getRoom?.(chatId);
+    if (!room || room.currentState?.getStateEvents?.("m.room.encryption", "")) return;
     const content = { "m.relates_to": { rel_type: "m.annotation", event_id: targetEventId, key } };
     void Promise.resolve(this.client.sendEvent(chatId, "m.reaction", content)).catch(() => {});
   }
@@ -326,10 +698,15 @@ class MatrixChannelAdapter {
     if (!chatId || !this.settings.allowedRooms.has(chatId)) return;
 
     const type = get(event, "getType", "type");
-    if (type === "m.room.encrypted") {
+    const wireType = (
+      typeof event?.getWireType === "function"
+        ? event.getWireType()
+        : event?.event?.type ?? type
+    );
+    if (wireType === "m.room.encrypted" || type === "m.room.encrypted") {
       if (!this.warnedEncryptedRooms.has(chatId)) {
         this.warnedEncryptedRooms.add(chatId);
-        console.warn(`[${CHANNEL_ID}] ignoring E2EE event in ${chatId}; v1 does not implement Matrix crypto`);
+        console.warn(`[${CHANNEL_ID}] ignoring E2EE event in ${chatId}; post-decryption delivery is not implemented`);
       }
       return;
     }
@@ -402,7 +779,17 @@ class MatrixChannelAdapter {
       throw new Error("refusing Matrix outbound message outside configured rooms");
     }
     if (!text) throw new Error("Matrix send requires message text");
-    if (this.client.getRoom?.(chatId)?.currentState?.getStateEvents?.("m.room.encryption", "")) {
+    if (!this.initialSyncComplete) {
+      throw new Error("refusing Matrix outbound before initial sync completes");
+    }
+    if (!this.outboundRoomStateFresh) {
+      throw new Error("refusing Matrix outbound while room encryption state is not fresh");
+    }
+    const room = this.client.getRoom?.(chatId);
+    if (!room) {
+      throw new Error(`refusing Matrix outbound without loaded room state for ${chatId}`);
+    }
+    if (room?.currentState?.getStateEvents?.("m.room.encryption", "")) {
       throw new Error(`refusing to send plaintext into encrypted Matrix room ${chatId}`);
     }
 
