@@ -32,9 +32,11 @@ npm run test:e2ee
 
 That gate proves encrypted inbound/outbound wire events, peer decryption,
 same-device clean restart, SIGKILL recovery on both sides of the encrypted
-network write, corrupt-current fail-closed behavior, replacement-device
-bootstrap with old-device revocation, cross-process state ownership, and
-plaintext refusal both before sync and after encrypted room state loads.
+network write and after an acknowledged incremental sync, real-peer decryption
+of held and post-recovery ciphertext, corrupt-current fail-closed behavior,
+replacement-device bootstrap with old-device revocation, cross-process state
+ownership, and plaintext refusal both before sync and after encrypted room
+state loads.
 
 An unclean encrypted-runtime exit deliberately blocks normal startup. With the
 listener stopped, inspect the retained marker and current snapshot:

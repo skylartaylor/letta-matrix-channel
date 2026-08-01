@@ -84,6 +84,26 @@ async function matrixRequest(baseUrl, path, {
   return payload;
 }
 
+function megolmMessageIndex(content) {
+  assert.equal(content?.algorithm, "m.megolm.v1.aes-sha2");
+  const bytes = Buffer.from(content.ciphertext, "base64");
+  assert.equal(bytes[0], 3, "Megolm ciphertext uses the expected message version");
+  // vodozemac manually retains this field for index zero so libolm can decode it.
+  assert.equal(bytes[1], 0x08, "Megolm ciphertext starts with the message-index field");
+  let value = 0;
+  let factor = 1;
+  for (let index = 2; index < bytes.length && index < 7; index += 1) {
+    const byte = bytes[index];
+    value += (byte & 0x7f) * factor;
+    if ((byte & 0x80) === 0) {
+      assert.equal(Number.isSafeInteger(value), true);
+      return value;
+    }
+    factor *= 128;
+  }
+  assert.fail("Megolm ciphertext has an invalid message-index varint");
+}
+
 async function login(baseUrl, localpart, deviceId) {
   return await matrixRequest(baseUrl, "/_matrix/client/v3/login", {
     method: "POST",
@@ -442,6 +462,9 @@ async function runCrashScenario({
 
   if (mode === "before-room-fetch") {
     assert.equal(boundary.eventId, undefined);
+    assert.equal(typeof boundary.heldRequest?.path, "string");
+    assert.equal(boundary.heldRequest?.content?.algorithm, "m.megolm.v1.aes-sha2");
+    assert.equal(typeof boundary.heldRequest?.content?.ciphertext, "string");
     assert.equal(
       await countRawBotEncryptedEvents(
         httpBaseUrl,
@@ -494,6 +517,36 @@ async function runCrashScenario({
     httpBaseUrl,
     roomId,
   });
+  let heldAfterRecovery = null;
+  if (mode === "before-room-fetch") {
+    const heldResponse = await matrixRequest(
+      httpBaseUrl,
+      boundary.heldRequest.path,
+      {
+        method: "PUT",
+        token: botLogin.access_token,
+        body: boundary.heldRequest.content,
+      },
+    );
+    const rawHeld = await findRawEvent(
+      httpBaseUrl,
+      botLogin.access_token,
+      roomId,
+      heldResponse.event_id,
+    );
+    assert.equal(rawHeld.type, "m.room.encrypted");
+    const heldByPeer = await peerRequest("waitForMessage", {
+      roomId,
+      sender: BOT_USER_ID,
+      text: crashText,
+    });
+    assert.equal(heldByPeer.eventId, heldResponse.event_id);
+    heldAfterRecovery = {
+      eventId: heldResponse.event_id,
+      content: rawHeld.content,
+      messageIndex: megolmMessageIndex(rawHeld.content),
+    };
+  }
   const resumedText = `${mode} encrypted event after recovery`;
   const resumed = await bot.request("sendMessage", { text: resumedText });
   const rawResumed = await findRawEvent(
@@ -509,6 +562,20 @@ async function runCrashScenario({
     text: resumedText,
   });
   assert.equal(resumedByPeer.eventId, resumed.messageId);
+  if (heldAfterRecovery) {
+    assert.notEqual(
+      heldAfterRecovery.eventId,
+      resumed.messageId,
+      "the held and resumed ciphertexts are distinct Matrix events",
+    );
+    if (heldAfterRecovery.content.session_id === rawResumed.content.session_id) {
+      assert.notEqual(
+        heldAfterRecovery.messageIndex,
+        megolmMessageIndex(rawResumed.content),
+        "held and resumed events use different indices in the same outbound Megolm session",
+      );
+    }
+  }
   const keysAfterRecovery = await queryDeviceKeys(
     httpBaseUrl,
     peerLogin.access_token,
@@ -531,6 +598,110 @@ async function runCrashScenario({
     text: inboundText,
   });
   assert.equal(delivered.messageId, inbound.eventId);
+  await bot.request("stop");
+  await waitUntil(() => bot.child.exitCode !== null, "Matrix bot child exit", 5_000);
+  bot = null;
+}
+
+async function runInboundSyncCrashScenario({
+  botLogin,
+  peerLogin,
+  configuredBaseUrl,
+  httpBaseUrl,
+  roomId,
+  keysBeforeCrash,
+}) {
+  const mode = "after-incremental-sync-accept";
+  bot = await startBot({
+    botLogin,
+    configuredBaseUrl,
+    httpBaseUrl,
+    roomId,
+    crashMode: mode,
+  });
+  await bot.request("armSyncCrash");
+  await peerRequest("forceDiscardSession", { roomId });
+  const seedText = "fresh inbound Megolm session before sync acknowledgement";
+  const seed = await peerRequest("sendMessage", {
+    roomId,
+    text: seedText,
+  });
+  await bot.request("releaseSyncCrash", { eventId: seed.eventId });
+  const rawSeed = await findRawEvent(
+    httpBaseUrl,
+    botLogin.access_token,
+    roomId,
+    seed.eventId,
+  );
+  assert.equal(rawSeed.type, "m.room.encrypted");
+  assert.equal(typeof rawSeed.content.session_id, "string");
+
+  const boundary = await bot.waitForCrashBoundary();
+  assert.equal(boundary.mode, mode);
+  assert.equal(typeof boundary.acknowledgedBatch, "string");
+  assert.equal(boundary.toDeviceEventCount > 0, true);
+  assert.equal(
+    boundary.seedEventId,
+    seed.eventId,
+    "the persisted sync acknowledgement is bound to the fresh-session seed event",
+  );
+  const exited = once(bot.child, "exit");
+  bot.child.kill("SIGKILL");
+  const [exitCode, signal] = await exited;
+  assert.equal(exitCode, null);
+  assert.equal(signal, "SIGKILL");
+  bot = null;
+
+  await assert.rejects(
+    () => startBot({
+      botLogin,
+      configuredBaseUrl,
+      httpBaseUrl,
+      roomId,
+    }),
+    /previous encrypted runtime did not shut down cleanly/,
+  );
+  await recoverCrashedBot(configuredBaseUrl);
+
+  bot = await startBot({
+    botLogin,
+    configuredBaseUrl,
+    httpBaseUrl,
+    roomId,
+  });
+  const continuedText = "matrix same inbound Megolm session after sync crash recovery";
+  const continued = await peerRequest("sendMessage", {
+    roomId,
+    text: continuedText,
+  });
+  const rawContinued = await findRawEvent(
+    httpBaseUrl,
+    botLogin.access_token,
+    roomId,
+    continued.eventId,
+  );
+  assert.equal(rawContinued.type, "m.room.encrypted");
+  assert.equal(
+    rawContinued.content.session_id,
+    rawSeed.content.session_id,
+    "post-recovery inbound delivery uses the fresh Megolm session acknowledged before the crash",
+  );
+  const delivered = await bot.request("waitForMessage", {
+    eventId: continued.eventId,
+    text: continuedText,
+  });
+  assert.equal(delivered.messageId, continued.eventId);
+  const keysAfterRecovery = await queryDeviceKeys(
+    httpBaseUrl,
+    peerLogin.access_token,
+    BOT_USER_ID,
+    BOT_DEVICE_ID,
+  );
+  assert.deepEqual(
+    keysAfterRecovery,
+    keysBeforeCrash,
+    "sync crash recovery preserves the Matrix device identity",
+  );
   await bot.request("stop");
   await waitUntil(() => bot.child.exitCode !== null, "Matrix bot child exit", 5_000);
   bot = null;
@@ -754,6 +925,14 @@ try {
   });
   await runCrashScenario({
     mode: "after-room-accept",
+    botLogin,
+    peerLogin,
+    configuredBaseUrl,
+    httpBaseUrl,
+    roomId,
+    keysBeforeCrash: keysBeforeRestart,
+  });
+  await runInboundSyncCrashScenario({
     botLogin,
     peerLogin,
     configuredBaseUrl,

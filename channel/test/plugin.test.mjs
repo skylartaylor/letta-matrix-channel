@@ -44,6 +44,7 @@ writeFileSync(
 );
 
 function makeClient(overrides = {}) {
+  let txnCounter = 0;
   const client = {
     credentials: {},
     handlers: new Map(),
@@ -58,6 +59,7 @@ function makeClient(overrides = {}) {
       client.receipts.push(event);
     },
     getUserId: () => null,
+    makeTxnId: () => `mtest.${txnCounter++}`,
     whoami: async () => {
       client.calls.push("whoami");
       return { user_id: SELF };
@@ -356,37 +358,52 @@ try {
     assert.equal(existsSync(join(stateDir, "crypto-idb.snapshot")), true);
   });
 
-  await test("encrypted sync transitions request bounded persistence barriers", async () => {
+  await test("encrypted incremental sync checkpoints before acknowledging crypto state", async () => {
     const stateDir = makeCryptoStateDir("sync-barriers");
     const client = makeEncryptedClient({
       initRustCrypto: async () => {},
     });
-    const { adapter } = makeFactoryAdapter({
+    const made = makeFactoryAdapter({
       clients: [client],
       config: { encryption: { enabled: true, stateDir } },
     });
+    const { adapter } = made;
+    const originalError = console.error;
     try {
       await adapter.start();
-      const realPersist = adapter.cryptoRuntime.persist.bind(adapter.cryptoRuntime);
-      const checkpoints = [];
-      adapter.cryptoRuntime.persist = () => {
-        checkpoints.push("persist");
-        return realPersist();
+      const fetchFn = made.getCreateOptions()[0].fetchFn;
+      const order = [];
+      adapter.cryptoRuntime.persist = async () => {
+        order.push("persist");
       };
-      for (const state of [
-        "RECONNECTING",
-        "PREPARED",
-        ...Array.from({ length: 100 }, () => "SYNCING"),
-        "ERROR",
-      ]) {
-        for (const handler of client.handlers.get("sync") ?? []) handler(state);
-      }
-      assert.equal(
-        checkpoints.length,
-        1,
-        "steady-state sync loops rely on the periodic checkpoint",
+      adapter.networkFetch = async () => {
+        order.push("fetch");
+        return { ok: true };
+      };
+
+      await fetchFn("https://example.org/_matrix/client/v3/sync?timeout=30000");
+      assert.deepEqual(order, ["fetch"], "initial sync has no prior crypto response to acknowledge");
+      order.length = 0;
+      await fetchFn(
+        "https://example.org/_matrix/client/v3/sync?since=next_batch_1&timeout=30000",
       );
+      assert.deepEqual(order, ["persist", "fetch"]);
+      order.length = 0;
+
+      console.error = () => {};
+      adapter.cryptoRuntime.persist = async () => {
+        order.push("persist-failed");
+        throw new Error("injected sync checkpoint failure");
+      };
+      await assert.rejects(
+        () => fetchFn(
+          "https://example.org/_matrix/client/v3/sync?since=next_batch_2&timeout=30000",
+        ),
+        /refusing Matrix incremental sync without current persisted crypto state/,
+      );
+      assert.deepEqual(order, ["persist-failed"], "failed persistence prevents sync acknowledgement");
     } finally {
+      console.error = originalError;
       await adapter.stop();
     }
   });
@@ -1132,7 +1149,7 @@ try {
     }
   });
 
-  await test("encrypted inbound delivery fails closed when its crypto checkpoint fails", async () => {
+  await test("encrypted inbound delivery retries at the next persisted sync boundary", async () => {
     const stateDir = makeCryptoStateDir("decrypted-inbound-checkpoint");
     const errors = [];
     const quietError = console.error;
@@ -1140,10 +1157,11 @@ try {
     const client = makeEncryptedClient({
       initRustCrypto: async () => {},
     });
-    const { adapter, inbound } = makeFactoryAdapter({
+    const made = makeFactoryAdapter({
       clients: [client],
       config: { encryption: { enabled: true, stateDir } },
     });
+    const { adapter, inbound } = made;
     try {
       await adapter.start();
       for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
@@ -1158,14 +1176,289 @@ try {
       await waitUntil(() => errors.length === 1, "failed inbound crypto checkpoint");
       assert.equal(inbound.length, 0);
       assert.equal(adapter.seenEventIds.has("$checkpoint-failure"), false);
+      assert.equal(adapter.pendingEncryptedDeliveries.size, 1);
       assert.match(errors.join("\n"), /crypto persistence checkpoint failed/);
 
-      adapter.cryptoRuntime.persist = realPersist;
-      await emit(client, encrypted, encryptedRoom());
-      await waitUntil(() => inbound.length === 1, "retried inbound delivery");
-      assert.equal(inbound.length, 1, "the SDK may retry after persistence recovers");
+      const order = [];
+      adapter.cryptoRuntime.persist = async () => {
+        order.push("persist");
+        await realPersist();
+      };
+      adapter.onMessage = async (message) => {
+        order.push("deliver");
+        inbound.push(message);
+      };
+      adapter.networkFetch = async () => {
+        order.push("fetch");
+        return { ok: true };
+      };
+      await made.getCreateOptions()[0].fetchFn(
+        "https://example.org/_matrix/client/v3/sync?since=retry_batch&timeout=30000",
+      );
+      await waitUntil(
+        () => (
+          inbound.length === 1
+          && adapter.pendingEncryptedDeliveries.size === 0
+        ),
+        "queued inbound replay",
+      );
+      assert.equal(inbound.length, 1);
+      assert.equal(adapter.pendingEncryptedDeliveries.size, 0);
+      assert.equal(order[0], "persist");
+      assert.deepEqual(order.slice(1).sort(), ["deliver", "fetch"]);
     } finally {
       console.error = quietError;
+      await adapter.stop();
+    }
+  });
+
+  await test("queued inbound replay retries after the host rejects delivery", async () => {
+    const stateDir = makeCryptoStateDir("decrypted-inbound-host-retry");
+    const errors = [];
+    const quietError = console.error;
+    console.error = (...args) => errors.push(args.join(" "));
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+    });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    const { adapter, inbound } = made;
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      adapter.cryptoRuntime.persist = async () => {
+        throw new Error("synthetic checkpoint failure");
+      };
+      const encrypted = encryptedMessageEvent("$queued-host-retry", "matrix retry", {
+        state: "decrypted",
+      });
+      await emit(client, encrypted, encryptedRoom());
+      await waitUntil(
+        () => adapter.pendingEncryptedDeliveries.size === 1,
+        "queued inbound before host retry",
+      );
+
+      let hostAttempts = 0;
+      adapter.cryptoRuntime.persist = async () => {};
+      adapter.onMessage = async (message) => {
+        hostAttempts += 1;
+        if (hostAttempts === 1) throw new Error("synthetic host rejection");
+        inbound.push(message);
+      };
+      adapter.networkFetch = async () => ({ ok: true });
+      const fetchFn = made.getCreateOptions()[0].fetchFn;
+      await fetchFn(
+        "https://example.org/_matrix/client/v3/sync?since=host_retry_1",
+      );
+      await waitUntil(
+        () => (
+          hostAttempts === 1
+          && adapter.pendingEncryptedDeliveries.get("$queued-host-retry")?.replaying === false
+        ),
+        "queued inbound reset after host rejection",
+      );
+      assert.equal(adapter.pendingEncryptedDeliveries.size, 1);
+      assert.equal(adapter.seenEventIds.has("$queued-host-retry"), false);
+      assert.match(errors.join("\n"), /synthetic host rejection/);
+
+      await fetchFn(
+        "https://example.org/_matrix/client/v3/sync?since=host_retry_2",
+      );
+      await waitUntil(
+        () => (
+          inbound.length === 1
+          && adapter.pendingEncryptedDeliveries.size === 0
+        ),
+        "queued inbound host retry delivery",
+      );
+      assert.equal(hostAttempts, 2);
+      assert.equal(inbound[0].messageId, "$queued-host-retry");
+    } finally {
+      console.error = quietError;
+      await adapter.stop();
+    }
+  });
+
+  await test("a slow host while flushing queued inbound does not stop sync", async () => {
+    const stateDir = makeCryptoStateDir("decrypted-inbound-host-failure");
+    const errors = [];
+    const quietError = console.error;
+    console.error = (...args) => errors.push(args.join(" "));
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+    });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    const { adapter, inbound } = made;
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      adapter.cryptoRuntime.persist = async () => {
+        throw new Error("synthetic checkpoint failure");
+      };
+      const encrypted = encryptedMessageEvent("$queued-host-failure", "matrix secret", {
+        state: "decrypted",
+      });
+      await emit(client, encrypted, encryptedRoom());
+      await waitUntil(
+        () => adapter.pendingEncryptedDeliveries.size === 1,
+        "queued inbound after checkpoint failure",
+      );
+
+      const order = [];
+      let releaseHost;
+      const hostReleased = new Promise((resolve) => {
+        releaseHost = resolve;
+      });
+      adapter.cryptoRuntime.persist = async () => {
+        order.push("persist");
+      };
+      adapter.onMessage = async () => {
+        order.push("deliver");
+        await hostReleased;
+      };
+      adapter.networkFetch = async () => {
+        order.push("fetch");
+        return { ok: true };
+      };
+      await made.getCreateOptions()[0].fetchFn(
+        "https://example.org/_matrix/client/v3/sync?since=host_failure_batch",
+      );
+      await waitUntil(() => order.includes("deliver"), "detached queued inbound replay");
+      assert.equal(order[0], "persist");
+      assert.deepEqual(order.slice(1).sort(), ["deliver", "fetch"]);
+      assert.equal(adapter.pendingEncryptedDeliveries.size, 1);
+      releaseHost();
+      await waitUntil(
+        () => adapter.pendingEncryptedDeliveries.size === 0,
+        "completed detached queued inbound replay",
+      );
+      assert.equal(adapter.pendingEncryptedDeliveries.size, 0);
+      assert.equal(adapter.seenEventIds.has("$queued-host-failure"), true);
+      assert.equal(inbound.length, 0);
+    } finally {
+      console.error = quietError;
+      await adapter.stop();
+    }
+  });
+
+  await test("stopping during queued replay telemetry logs the lifecycle drop", async () => {
+    const stateDir = makeCryptoStateDir("decrypted-inbound-replay-stop");
+    const warnings = [];
+    const quietError = console.error;
+    const quietWarn = console.warn;
+    console.error = () => {};
+    console.warn = (...args) => warnings.push(args.join(" "));
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+    });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    const { adapter, inbound } = made;
+    let releaseTelemetry;
+    const telemetryReleased = new Promise((resolve) => {
+      releaseTelemetry = resolve;
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      adapter.cryptoRuntime.persist = async () => {
+        throw new Error("synthetic checkpoint failure");
+      };
+      const encrypted = encryptedMessageEvent(
+        "$queued-replay-stop",
+        "matrix replay content must not be logged",
+        { state: "decrypted" },
+      );
+      await emit(client, encrypted, encryptedRoom());
+      await waitUntil(
+        () => adapter.pendingEncryptedDeliveries.size === 1,
+        "queued inbound before replay",
+      );
+
+      adapter.cryptoRuntime.persist = async () => {};
+      adapter.recordEncryptionTelemetry = async () => {
+        await telemetryReleased;
+      };
+      adapter.networkFetch = async () => ({ ok: true });
+      await made.getCreateOptions()[0].fetchFn(
+        "https://example.org/_matrix/client/v3/sync?since=replay_stop_batch",
+      );
+      assert.equal(adapter.pendingEncryptedDeliveries.size, 1);
+      await adapter.stop();
+      releaseTelemetry();
+      await waitUntil(
+        () => adapter.seenEventIds.has("$queued-replay-stop") === false,
+        "stale queued replay completion",
+      );
+
+      assert.equal(inbound.length, 0);
+      assert.equal(adapter.pendingEncryptedDeliveries.size, 0);
+      assert.equal(warnings.length, 1);
+      assert.match(
+        warnings[0],
+        /dropping queued encrypted event account=main room=!room:example\.org event=\$queued-replay-stop reason=lifecycle-reset/,
+      );
+      assert.doesNotMatch(warnings[0], /matrix replay content must not be logged/);
+    } finally {
+      releaseTelemetry();
+      console.error = quietError;
+      console.warn = quietWarn;
+      await adapter.stop();
+    }
+  });
+
+  await test("stopping logs queued encrypted delivery loss without message content", async () => {
+    const stateDir = makeCryptoStateDir("decrypted-inbound-stop-drop");
+    const errors = [];
+    const warnings = [];
+    const quietError = console.error;
+    const quietWarn = console.warn;
+    console.error = (...args) => errors.push(args.join(" "));
+    console.warn = (...args) => warnings.push(args.join(" "));
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+    });
+    const { adapter, inbound } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      adapter.cryptoRuntime.persist = async () => {
+        throw new Error("synthetic checkpoint failure");
+      };
+      const encrypted = encryptedMessageEvent(
+        "$queued-stop-drop",
+        "matrix content must not be logged",
+        { state: "decrypted" },
+      );
+      await emit(client, encrypted, encryptedRoom());
+      await waitUntil(
+        () => adapter.pendingEncryptedDeliveries.size === 1,
+        "queued inbound before stop",
+      );
+
+      await adapter.stop();
+
+      assert.equal(inbound.length, 0);
+      assert.equal(adapter.pendingEncryptedDeliveries.size, 0);
+      assert.equal(warnings.length, 1);
+      assert.match(
+        warnings[0],
+        /dropping queued encrypted event account=main room=!room:example\.org event=\$queued-stop-drop reason=lifecycle-reset/,
+      );
+      assert.doesNotMatch(warnings[0], /matrix content must not be logged/);
+    } finally {
+      console.error = quietError;
+      console.warn = quietWarn;
       await adapter.stop();
     }
   });
@@ -1708,6 +2001,188 @@ try {
     await adapter.stop();
   });
 
+  await test("room send boundary rejects unregistered plaintext requests", async () => {
+    const made = await startedAdapter();
+    let networkCalls = 0;
+    try {
+      made.adapter.networkFetch = async () => {
+        networkCalls += 1;
+        return { ok: true };
+      };
+      const fetchFn = made.getCreateOptions()[0].fetchFn;
+      await assert.rejects(
+        () => fetchFn(
+          "https://example.org/_matrix/client/v3/rooms/%21room%3Aexample.org"
+          + "/send/m.room.message/unregistered",
+          { method: "PUT" },
+        ),
+        /refusing Matrix room send while lifecycle or room state is stale/,
+      );
+      assert.equal(networkCalls, 0);
+    } finally {
+      await made.adapter.stop();
+    }
+  });
+
+  await test("room send boundary revalidates an in-flight stale-to-fresh transition", async () => {
+    let enterSend;
+    let releaseSend;
+    let fetchFn;
+    const sendEntered = new Promise((resolve) => {
+      enterSend = resolve;
+    });
+    const sendGate = new Promise((resolve) => {
+      releaseSend = resolve;
+    });
+    let networkCalls = 0;
+    const made = makeAdapter({
+      client: {
+        sendEvent: async (chatId, eventType, content, txnId) => {
+          made.client.outbound.push([chatId, eventType, content, txnId]);
+          enterSend();
+          await sendGate;
+          await fetchFn(
+            `https://example.org/_matrix/client/v3/rooms/${encodeURIComponent(chatId)}`
+            + `/send/${eventType}/${encodeURIComponent(txnId)}`,
+            { method: "PUT" },
+          );
+          return { event_id: "$revalidated-send" };
+        },
+      },
+    });
+    try {
+      await made.adapter.start();
+      for (const handler of made.client.handlers.get("sync") ?? []) handler("PREPARED");
+      for (const handler of made.client.handlers.get("sync") ?? []) handler("SYNCING");
+      fetchFn = made.getCreateOptions()[0].fetchFn;
+      made.adapter.networkFetch = async () => {
+        networkCalls += 1;
+        return { ok: true };
+      };
+
+      const sending = made.adapter.sendMessage({ chatId: ROOM, text: "racing state" });
+      await sendEntered;
+      for (const handler of made.client.handlers.get("sync") ?? []) handler("RECONNECTING");
+      for (const handler of made.client.handlers.get("sync") ?? []) handler("SYNCING");
+      releaseSend();
+      assert.deepEqual(await sending, { messageId: "$revalidated-send" });
+      assert.equal(networkCalls, 1);
+    } finally {
+      releaseSend?.();
+      await made.adapter.stop();
+    }
+  });
+
+  await test("room send boundary rejects an in-flight stale state", async () => {
+    let enterSend;
+    let releaseSend;
+    let fetchFn;
+    const sendEntered = new Promise((resolve) => {
+      enterSend = resolve;
+    });
+    const sendGate = new Promise((resolve) => {
+      releaseSend = resolve;
+    });
+    let networkCalls = 0;
+    const made = makeAdapter({
+      client: {
+        sendEvent: async (chatId, eventType, content, txnId) => {
+          made.client.outbound.push([chatId, eventType, content, txnId]);
+          enterSend();
+          await sendGate;
+          await fetchFn(
+            `https://example.org/_matrix/client/v3/rooms/${encodeURIComponent(chatId)}`
+            + `/send/${eventType}/${encodeURIComponent(txnId)}`,
+            { method: "PUT" },
+          );
+          return { event_id: "$fresh-send" };
+        },
+      },
+    });
+    try {
+      await made.adapter.start();
+      for (const handler of made.client.handlers.get("sync") ?? []) handler("PREPARED");
+      fetchFn = made.getCreateOptions()[0].fetchFn;
+      made.adapter.networkFetch = async () => {
+        networkCalls += 1;
+        return { ok: true };
+      };
+
+      const sending = made.adapter.sendMessage({ chatId: ROOM, text: "stale at boundary" });
+      await sendEntered;
+      for (const handler of made.client.handlers.get("sync") ?? []) handler("RECONNECTING");
+      releaseSend();
+      await assert.rejects(
+        () => sending,
+        /refusing Matrix room send while lifecycle or room state is stale/,
+      );
+      assert.equal(networkCalls, 0);
+    } finally {
+      releaseSend?.();
+      await made.adapter.stop();
+    }
+  });
+
+  await test("room send boundary rejects encryption enabled during an in-flight send", async () => {
+    let enterSend;
+    let releaseSend;
+    let fetchFn;
+    let encrypted = false;
+    const sendEntered = new Promise((resolve) => {
+      enterSend = resolve;
+    });
+    const sendGate = new Promise((resolve) => {
+      releaseSend = resolve;
+    });
+    const loadedRoom = {
+      hasEncryptionStateEvent: () => encrypted,
+      currentState: {
+        getStateEvents: (type, key) => (
+          encrypted && type === "m.room.encryption" && key === "" ? { type } : null
+        ),
+      },
+    };
+    let networkCalls = 0;
+    const made = makeAdapter({
+      client: {
+        getRoom: () => loadedRoom,
+        sendEvent: async (chatId, eventType, content, txnId) => {
+          made.client.outbound.push([chatId, eventType, content, txnId]);
+          enterSend();
+          await sendGate;
+          await fetchFn(
+            `https://example.org/_matrix/client/v3/rooms/${encodeURIComponent(chatId)}`
+            + `/send/${eventType}/${encodeURIComponent(txnId)}`,
+            { method: "PUT" },
+          );
+          return { event_id: "$should-not-send" };
+        },
+      },
+    });
+    try {
+      await made.adapter.start();
+      for (const handler of made.client.handlers.get("sync") ?? []) handler("PREPARED");
+      fetchFn = made.getCreateOptions()[0].fetchFn;
+      made.adapter.networkFetch = async () => {
+        networkCalls += 1;
+        return { ok: true };
+      };
+
+      const sending = made.adapter.sendMessage({ chatId: ROOM, text: "racing encryption" });
+      await sendEntered;
+      encrypted = true;
+      releaseSend();
+      await assert.rejects(
+        () => sending,
+        /refusing plaintext Matrix event at the encrypted-room HTTP boundary/,
+      );
+      assert.equal(networkCalls, 0);
+    } finally {
+      releaseSend?.();
+      await made.adapter.stop();
+    }
+  });
+
   await test("encrypted mode refuses outbound until room encryption state is loaded", async () => {
     const stateDir = makeCryptoStateDir("outbound-gate");
     const client = makeEncryptedClient({
@@ -1759,6 +2234,7 @@ try {
         ROOM,
         "m.room.message",
         { msgtype: "m.text", body: "matrix encrypted hello" },
+        "mtest.0",
       ]]);
     } finally {
       await adapter.stop();
@@ -1775,6 +2251,7 @@ try {
     const errors = console.error;
     try {
       await made.adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
       const fetchFn = made.getCreateOptions()[0].fetchFn;
       const order = [];
       made.adapter.cryptoRuntime.persist = async () => {
@@ -1867,6 +2344,7 @@ try {
     let networkCalls = 0;
     try {
       await made.adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
       made.adapter.cryptoRuntime.persist = async () => {
         enterBarrier();
         await barrierGate;
@@ -1887,6 +2365,48 @@ try {
         /refusing Matrix encrypted request without a current persisted crypto runtime/,
       );
       assert.equal(networkCalls, 0);
+    } finally {
+      releaseBarrier?.();
+      await made.adapter.stop();
+    }
+  });
+
+  await test("an already encrypted request may finish across a sync reconnect", async () => {
+    const stateDir = makeCryptoStateDir("encrypted-request-reconnect");
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    let enterBarrier;
+    let releaseBarrier;
+    const barrierEntered = new Promise((resolve) => {
+      enterBarrier = resolve;
+    });
+    const barrierGate = new Promise((resolve) => {
+      releaseBarrier = resolve;
+    });
+    let networkCalls = 0;
+    try {
+      await made.adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      made.adapter.cryptoRuntime.persist = async () => {
+        enterBarrier();
+        await barrierGate;
+      };
+      made.adapter.networkFetch = async () => {
+        networkCalls += 1;
+        return { ok: true };
+      };
+      const request = made.getCreateOptions()[0].fetchFn(
+        "https://example.org/_matrix/client/v3/rooms/%21room%3Aexample.org/send/m.room.encrypted/reconnecting",
+        { method: "PUT" },
+      );
+      await barrierEntered;
+      for (const handler of client.handlers.get("sync") ?? []) handler("RECONNECTING");
+      releaseBarrier();
+      await request;
+      assert.equal(networkCalls, 1);
     } finally {
       releaseBarrier?.();
       await made.adapter.stop();

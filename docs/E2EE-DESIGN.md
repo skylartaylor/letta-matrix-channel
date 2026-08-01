@@ -83,7 +83,22 @@ These checkpoints reduce the amount of state exposed to a process crash.
 Fake-IndexedDB snapshots cannot transact across both crypto databases, so
 encrypted network writes pass a serialized snapshot barrier after the SDK
 advances crypto state and before the request reaches the network.
+Before each incremental `/sync` request, the adapter also snapshots crypto
+state processed from the preceding response. If that snapshot fails, it does
+not send the next `since` token or acknowledge those to-device updates.
+Byte-identical state is read and validated but skips snapshot republication and
+generation rotation; it still syncs the state directory to confirm any prior
+rename before the barrier succeeds.
+This v1 barrier deliberately dumps and compares the complete crypto databases
+before every incremental sync. That correctness-first cost should be measured
+with production-sized stores before any future dirty-state optimization; an
+incomplete activity heuristic could acknowledge unpersisted key state.
 Previous-generation rollback remains forbidden.
+
+If a decrypted-event checkpoint fails, the adapter retries that delivery after
+the next successful incremental-sync barrier. This retry queue is process-local,
+not a durable host-delivery queue; lifecycle teardown drops queued entries with
+a content-free warning so the loss is observable.
 
 Clean shutdown advances through a final snapshot, owned active-marker removal,
 filesystem-lock release, and process-guard release. Each destructive step
@@ -127,11 +142,14 @@ recovery, single-owner enforcement, and no plaintext send before sync.
 The Docker-backed `npm run test:e2ee` gate now proves real encrypted inbound and
 outbound wire events, peer decryption, same-device clean restart, device-key
 continuity, explicit recovery after SIGKILL both before the room fetch and
-after Synapse accepts the event, continued bidirectional encryption without
-Megolm-index reuse, corrupt-current fail-closed behavior, new-device bootstrap
-on an unused state directory with old-device revocation, cross-process
-state-lock enforcement, and no plaintext room-send request before or after
-sync.
+after Synapse accepts the event, and recovery after Synapse accepts an
+incremental sync following fresh inbound session state. The pre-network crash
+case publishes both the held ciphertext and a newly encrypted post-recovery
+event; the real peer decrypts both, guarding against outbound Megolm-index
+reuse. The gate also covers corrupt-current fail-closed behavior, new-device
+bootstrap on an unused state directory with old-device revocation,
+cross-process state-lock enforcement, and no plaintext room-send request before
+or after sync.
 
 A missing or corrupt current snapshot is not recoverable as the same device.
 The operator must revoke that device through a trusted Matrix client, obtain a

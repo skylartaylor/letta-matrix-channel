@@ -167,6 +167,7 @@ try {
     identity: recoverableIdentity,
     client: makeRuntimeClient(async () => { await writeProbe("recoverable"); }),
   });
+  await writeProbe("recoverable-updated");
   await recoverable.stop();
   const recoverableSnapshotFixture = join(roots[3], "recoverable-current.snapshot");
   await copyFile(
@@ -198,7 +199,7 @@ try {
     stateDir: stateD,
     identity: recoverableIdentity,
     client: makeRuntimeClient(async () => {
-      assert.equal(await readProbe(), "recoverable");
+      assert.equal(await readProbe(), "recoverable-updated");
     }),
   });
   await recovered.stop();

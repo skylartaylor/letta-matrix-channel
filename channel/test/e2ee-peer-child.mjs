@@ -117,6 +117,9 @@ async function handleCommand(command) {
       );
       return { eventId: response.event_id };
     }
+    case "forceDiscardSession":
+      await client.getCrypto().forceDiscardSession(command.roomId);
+      return {};
     case "waitForMessage": {
       const message = await waitUntil(
         () => messages.find((candidate) => (

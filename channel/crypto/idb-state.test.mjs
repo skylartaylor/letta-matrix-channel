@@ -44,6 +44,15 @@ async function deleteDatabase(name) {
   await request(indexedDB.deleteDatabase(name));
 }
 
+async function writeCoreRecord(databaseName, key, value) {
+  const database = await request(indexedDB.open(databaseName, 12));
+  const tx = database.transaction("core", "readwrite");
+  const written = complete(tx);
+  tx.objectStore("core").put(value, key);
+  await written;
+  database.close();
+}
+
 const identity = {
   homeserverUrl: "https://example.org/",
   userId: "@bot:example.org",
@@ -134,10 +143,26 @@ try {
     [expectedSnapshotStores],
     "one readonly transaction captures every store in the crypto database",
   );
-  assert.equal(await persistCryptoState(stateDir), 1, "second snapshot preserves a prior generation");
   const currentSnapshot = join(stateDir, "crypto-idb.snapshot");
   const previousSnapshot = join(stateDir, "crypto-idb.snapshot.previous");
+  const unchangedPublicationSteps = [];
+  assert.equal(
+    await persistCryptoState(stateDir, {
+      onPublicationStep: (step) => unchangedPublicationSteps.push(step),
+    }),
+    1,
+  );
+  assert.deepEqual(
+    unchangedPublicationSteps,
+    ["current-confirmed"],
+    "an unchanged snapshot confirms directory durability without republication",
+  );
+  assert.equal(existsSync(previousSnapshot), false, "unchanged state has no prior generation");
+  await writeCoreRecord(dbName, "snapshot-generation", 1);
+  assert.equal(await persistCryptoState(stateDir), 1, "changed state preserves a prior generation");
+  assert.equal(existsSync(previousSnapshot), true);
   const validCurrentFixture = join(stateDir, "test-valid-current.snapshot");
+  let snapshotGeneration = 1;
   for (const crashPoint of [
     "new-snapshot-synced",
     "previous-candidate-synced",
@@ -145,6 +170,8 @@ try {
     "current-installed",
     "current-synced",
   ]) {
+    snapshotGeneration += 1;
+    await writeCoreRecord(dbName, "snapshot-generation", snapshotGeneration);
     await assert.rejects(
       () => persistCryptoState(stateDir, {
         onPublicationStep(step) {
@@ -158,6 +185,20 @@ try {
       }),
       new RegExp(`simulated crash at ${crashPoint}`),
     );
+    if (crashPoint === "current-installed") {
+      const retrySteps = [];
+      assert.equal(
+        await persistCryptoState(stateDir, {
+          onPublicationStep: (step) => retrySteps.push(step),
+        }),
+        1,
+      );
+      assert.deepEqual(
+        retrySteps,
+        ["current-confirmed"],
+        "an unchanged retry syncs a previously unconfirmed current rename",
+      );
+    }
     assert.deepEqual(
       await validateCurrentCryptoSnapshot(stateDir),
       { databaseCount: 1 },

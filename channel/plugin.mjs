@@ -81,6 +81,48 @@ function cryptoWriteAheadRequest(input) {
   ));
 }
 
+function incrementalSyncRequest(input) {
+  const rawUrl = typeof input === "string" || input instanceof URL
+    ? String(input)
+    : input?.url;
+  if (!rawUrl) return false;
+  try {
+    const url = new URL(rawUrl);
+    return (
+      url.pathname.endsWith("/sync")
+      && nonEmpty(url.searchParams.get("since")) !== null
+    );
+  } catch {
+    return false;
+  }
+}
+
+function roomSendRequest(input) {
+  const rawUrl = typeof input === "string" || input instanceof URL
+    ? String(input)
+    : input?.url;
+  if (!rawUrl) return null;
+  let segments;
+  try {
+    segments = new URL(rawUrl).pathname.split("/");
+  } catch {
+    return null;
+  }
+  const roomsIndex = segments.findIndex((segment, index) => (
+    segment === "rooms" && segments[index + 2] === "send"
+  ));
+  if (roomsIndex < 0) return null;
+  try {
+    return {
+      roomId: decodeURIComponent(segments[roomsIndex + 1] ?? ""),
+      eventType: decodeURIComponent(segments[roomsIndex + 3] ?? ""),
+      txnId: decodeURIComponent(segments[roomsIndex + 4] ?? ""),
+    };
+  } catch {
+    return { roomId: "", eventType: "", txnId: "" };
+  }
+}
+
 function shieldLabel(value, labels, fallback) {
   return typeof value === "number" && labels[value]
     ? labels[value]
@@ -296,6 +338,8 @@ class MatrixChannelAdapter {
     this.lastTypingSentAt = new Map();
     this.warnedEncryptionConditions = new Set();
     this.encryptedEventContexts = new WeakMap();
+    this.pendingEncryptedDeliveries = new Map();
+    this.pendingRoomSends = new Map();
     this.cryptoRuntime = null;
     this.pendingRuntimeStop = null;
     this.runtimeCleanupError = null;
@@ -318,6 +362,27 @@ class MatrixChannelAdapter {
   }
 
   async fetchMatrix(fetchToken, input, init) {
+    if (this.settings.encryptionEnabled && incrementalSyncRequest(input)) {
+      const runtime = this.cryptoRuntime;
+      if (fetchToken !== this.clientFetchToken || !runtime) {
+        throw new Error("refusing stale or uninitialized Matrix incremental sync");
+      }
+      const persisted = await this.checkpointCryptoState("incremental-sync");
+      if (
+        !persisted
+        || fetchToken !== this.clientFetchToken
+        || this.cryptoRuntime !== runtime
+      ) {
+        throw new Error("refusing Matrix incremental sync without current persisted crypto state");
+      }
+      await this.flushPendingEncryptedDeliveries(fetchToken, runtime);
+      if (
+        fetchToken !== this.clientFetchToken
+        || this.cryptoRuntime !== runtime
+      ) {
+        throw new Error("refusing stale Matrix incremental sync after crypto checkpoint");
+      }
+    }
     if (cryptoWriteAheadRequest(input)) {
       const runtime = this.cryptoRuntime;
       if (
@@ -336,6 +401,8 @@ class MatrixChannelAdapter {
         throw new Error("refusing Matrix encrypted request without a current persisted crypto runtime");
       }
     }
+    const roomSend = roomSendRequest(input);
+    if (roomSend) this.assertRoomSendBoundary(fetchToken, roomSend);
     if (typeof this.networkFetch !== "function") {
       throw new Error("Matrix network fetch is unavailable");
     }
@@ -368,6 +435,7 @@ class MatrixChannelAdapter {
     this.acceptedEpoch = null;
     this.initialSyncComplete = false;
     this.outboundRoomStateFresh = false;
+    this.pendingRoomSends.clear();
     if (
       !this.lifecyclePromise
       && !this.running
@@ -502,9 +570,6 @@ class MatrixChannelAdapter {
           normalized === "PREPARED"
           || normalized === "SYNCING"
         );
-        if (this.cryptoRuntime && normalized === "PREPARED") {
-          void this.checkpointCryptoState("sync");
-        }
       };
       timelineListener = (event, room, toStartOfTimeline, removed, data) => {
         if (!acceptsEvents()) return;
@@ -608,6 +673,7 @@ class MatrixChannelAdapter {
   }) {
     this.acceptedEpoch = null;
     this.clearEncryptedEventContexts();
+    this.pendingRoomSends.clear();
     const errors = [];
     let permanent = false;
     if (syncListenerAttached) {
@@ -700,6 +766,7 @@ class MatrixChannelAdapter {
     this.initialSyncComplete = false;
     this.outboundRoomStateFresh = false;
     this.clearEncryptedEventContexts();
+    this.pendingRoomSends.clear();
     const errors = [];
     let permanent = false;
     if (syncListener) {
@@ -793,7 +860,7 @@ class MatrixChannelAdapter {
     const room = this.client.getRoom?.(chatId);
     if (!room || roomIsEncrypted(room)) return;
     const content = { "m.relates_to": { rel_type: "m.annotation", event_id: targetEventId, key } };
-    void Promise.resolve(this.client.sendEvent(chatId, "m.reaction", content)).catch(() => {});
+    void this.sendRoomEvent(chatId, "m.reaction", content).catch(() => {});
   }
 
   // Turn events arrive for every adapter whose channel appears in the sources;
@@ -830,8 +897,128 @@ class MatrixChannelAdapter {
     }
   }
 
-  clearEncryptedEventContexts() {
+  warnDroppedEncryptedDelivery(messageId, pending, reason) {
+    console.warn(
+      `[${CHANNEL_ID}] dropping queued encrypted event`
+      + ` account=${safeLogToken(this.accountId)}`
+      + ` room=${safeLogToken(pending?.room?.roomId)}`
+      + ` event=${safeLogToken(messageId)}`
+      + ` reason=${safeLogToken(reason)}`,
+    );
+  }
+
+  dropPendingEncryptedDelivery(messageId, pending, reason) {
+    if (this.pendingEncryptedDeliveries.get(messageId) !== pending) return;
+    this.warnDroppedEncryptedDelivery(messageId, pending, reason);
+    this.pendingEncryptedDeliveries.delete(messageId);
+  }
+
+  clearEncryptedEventContexts(reason = "lifecycle-reset") {
     this.encryptedEventContexts = new WeakMap();
+    for (const [messageId, pending] of this.pendingEncryptedDeliveries) {
+      this.warnDroppedEncryptedDelivery(messageId, pending, reason);
+    }
+    this.pendingEncryptedDeliveries.clear();
+  }
+
+  assertRoomSendBoundary(fetchToken, {
+    roomId,
+    eventType,
+    txnId,
+  }) {
+    const pending = this.pendingRoomSends.get(txnId);
+    const plaintextRequest = eventType !== "m.room.encrypted";
+    const pendingMatches = (
+      pending
+      && pending.roomId === roomId
+      && pending.eventType === eventType
+      && pending.client === this.client
+      && pending.fetchToken === fetchToken
+      && pending.epoch === this.acceptedEpoch
+    );
+    if (
+      !roomId
+      || !eventType
+      || !txnId
+      || (plaintextRequest && !pendingMatches)
+      || fetchToken !== this.clientFetchToken
+      || !this.desiredRunning
+      || !this.running
+      || this.acceptedEpoch === null
+      || (
+        plaintextRequest
+        && (!this.initialSyncComplete || !this.outboundRoomStateFresh)
+      )
+    ) {
+      throw new Error("refusing Matrix room send while lifecycle or room state is stale");
+    }
+    const room = this.client.getRoom?.(roomId);
+    if (!room) {
+      throw new Error(`refusing Matrix room send without loaded room state for ${roomId}`);
+    }
+    if (plaintextRequest && roomIsEncrypted(room)) {
+      throw new Error(`refusing plaintext Matrix event at the encrypted-room HTTP boundary for ${roomId}`);
+    }
+  }
+
+  async sendRoomEvent(chatId, eventType, content) {
+    const client = this.client;
+    const txnId = nonEmpty(client.makeTxnId?.());
+    if (!txnId) throw new Error("Matrix client could not allocate a room-send transaction ID");
+    const pending = {
+      client,
+      fetchToken: this.clientFetchToken,
+      epoch: this.acceptedEpoch,
+      roomId: chatId,
+      eventType,
+    };
+    this.pendingRoomSends.set(txnId, pending);
+    try {
+      return await client.sendEvent(chatId, eventType, content, txnId);
+    } finally {
+      if (this.pendingRoomSends.get(txnId) === pending) {
+        this.pendingRoomSends.delete(txnId);
+      }
+    }
+  }
+
+  async flushPendingEncryptedDeliveries(fetchToken, runtime) {
+    for (const [messageId, pending] of [...this.pendingEncryptedDeliveries]) {
+      if (
+        fetchToken !== this.clientFetchToken
+        || this.cryptoRuntime !== runtime
+        || this.acceptedEpoch !== pending.epoch
+        || this.client !== pending.client
+      ) {
+        this.dropPendingEncryptedDelivery(messageId, pending, "stale-lifecycle");
+        continue;
+      }
+      if (pending.replaying) continue;
+      pending.replaying = true;
+      void this.handleTimelineEvent(
+        pending.event,
+        pending.room,
+        pending.toStartOfTimeline,
+        pending.removed,
+        pending.data,
+        {
+          cryptoCheckpointSatisfied: true,
+          queuedReplay: pending,
+        },
+      ).then(
+        () => {
+          if (this.pendingEncryptedDeliveries.get(messageId) === pending) {
+            this.pendingEncryptedDeliveries.delete(messageId);
+          }
+        },
+        (error) => {
+          if (this.pendingEncryptedDeliveries.get(messageId) === pending) {
+            pending.replaying = false;
+          }
+          console.error(`[${CHANNEL_ID}] inbound event failed for ${this.accountId}:`, error);
+        },
+      );
+    }
   }
 
   reportDecryptionFailure(event, observer, error) {
@@ -978,7 +1165,17 @@ class MatrixChannelAdapter {
     }
   }
 
-  async handleTimelineEvent(event, room, toStartOfTimeline, removed, data) {
+  async handleTimelineEvent(
+    event,
+    room,
+    toStartOfTimeline,
+    removed,
+    data,
+    {
+      cryptoCheckpointSatisfied = false,
+      queuedReplay = null,
+    } = {},
+  ) {
     const eventEpoch = this.acceptedEpoch;
     const eventClient = this.client;
     if (!this.initialSyncComplete) return;
@@ -1063,20 +1260,47 @@ class MatrixChannelAdapter {
         || this.client !== eventClient
         || !this.initialSyncComplete
       ) {
+        if (queuedReplay) {
+          this.dropPendingEncryptedDelivery(messageId, queuedReplay, "stale-lifecycle");
+        }
         this.seenEventIds.delete(messageId);
         return;
       }
-      const persisted = await this.checkpointCryptoState("decrypted-event");
+      const persisted = (
+        cryptoCheckpointSatisfied
+        || await this.checkpointCryptoState("decrypted-event")
+      );
+      if (!persisted) {
+        if (
+          this.acceptedEpoch === eventEpoch
+          && this.client === eventClient
+          && this.initialSyncComplete
+        ) {
+          this.pendingEncryptedDeliveries.set(messageId, {
+            event,
+            room,
+            toStartOfTimeline,
+            removed,
+            data,
+            epoch: eventEpoch,
+            client: eventClient,
+          });
+        }
+        this.seenEventIds.delete(messageId);
+        return;
+      }
       if (
-        !persisted
-        ||
         this.acceptedEpoch !== eventEpoch
         || this.client !== eventClient
         || !this.initialSyncComplete
       ) {
+        if (queuedReplay) {
+          this.dropPendingEncryptedDelivery(messageId, queuedReplay, "stale-lifecycle");
+        }
         this.seenEventIds.delete(messageId);
         return;
       }
+      if (!queuedReplay) this.pendingEncryptedDeliveries.delete(messageId);
     }
     const threadId = relation?.rel_type === "m.thread" && typeof relation.event_id === "string"
       ? relation.event_id
@@ -1163,7 +1387,7 @@ class MatrixChannelAdapter {
     } else if (replyToMessageId) {
       content["m.relates_to"] = { "m.in_reply_to": { event_id: replyToMessageId } };
     }
-    const response = await this.client.sendEvent(chatId, "m.room.message", content);
+    const response = await this.sendRoomEvent(chatId, "m.room.message", content);
     const eventId = nonEmpty(response?.event_id);
     if (threadId) this.rememberThreadTip(chatId, threadId, eventId);
     this.setTyping(chatId, false);

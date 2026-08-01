@@ -1149,6 +1149,16 @@ export async function persistCryptoState(
   const payload = serialize({ version: SNAPSHOT_VERSION, databases: snapshot });
   const target = statePath(stateDir);
   const previous = previousStatePath(stateDir);
+  try {
+    const published = await readFile(target);
+    if (published.equals(payload)) {
+      await syncDirectory(stateDir);
+      await onPublicationStep?.("current-confirmed");
+      return snapshot.length;
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   const previousTemporary = `${previous}.${process.pid}.${randomUUID()}.tmp`;
   const handle = await open(temporary, "wx", 0o600);

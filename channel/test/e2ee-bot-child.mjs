@@ -22,6 +22,7 @@ if (
   MATRIX_CRASH_MODE
   && MATRIX_CRASH_MODE !== "before-room-fetch"
   && MATRIX_CRASH_MODE !== "after-room-accept"
+  && MATRIX_CRASH_MODE !== "after-incremental-sync-accept"
 ) {
   throw new Error(`Unknown Matrix bot crash mode ${MATRIX_CRASH_MODE}`);
 }
@@ -33,8 +34,22 @@ function isEncryptedRoomSend(url) {
   return /\/rooms\/[^/]+\/send\/m\.room\.encrypted\//.test(url.pathname);
 }
 
+function isIncrementalSync(url) {
+  return url.pathname.endsWith("/sync") && url.searchParams.has("since");
+}
+
 let crashArmed = false;
 let crashTriggered = false;
+let cryptoSyncToAcknowledge = null;
+let expectedSeedEventId = null;
+let resolveSyncHeld;
+const syncHeld = new Promise((resolve) => {
+  resolveSyncHeld = resolve;
+});
+let releaseHeldSync;
+const heldSyncReleased = new Promise((resolve) => {
+  releaseHeldSync = resolve;
+});
 function makeTransport() {
   const httpOrigin = new URL(MATRIX_HTTP_BASE_URL);
   return async (input, init) => {
@@ -44,23 +59,59 @@ function makeTransport() {
     sourceUrl.protocol = httpOrigin.protocol;
     sourceUrl.hostname = httpOrigin.hostname;
     sourceUrl.port = httpOrigin.port;
-    const shouldCrash = (
+    const shouldCrashRoomSend = (
       crashArmed
       && !crashTriggered
       && isEncryptedRoomSend(sourceUrl)
     );
-    if (shouldCrash && MATRIX_CRASH_MODE === "before-room-fetch") {
+    const incrementalSync = isIncrementalSync(sourceUrl);
+    const requestedBatch = sourceUrl.searchParams.get("since");
+    if (
+      MATRIX_CRASH_MODE === "after-incremental-sync-accept"
+      && incrementalSync
+    ) {
+      sourceUrl.searchParams.set("timeout", "1000");
+    }
+    const shouldHoldIncrementalSync = (
+      crashArmed
+      && !crashTriggered
+      && MATRIX_CRASH_MODE === "after-incremental-sync-accept"
+      && incrementalSync
+      && cryptoSyncToAcknowledge === null
+    );
+    if (shouldHoldIncrementalSync) {
+      resolveSyncHeld();
+      await heldSyncReleased;
+      sourceUrl.searchParams.set("timeout", "0");
+    }
+    const shouldCrashIncrementalSync = (
+      crashArmed
+      && !crashTriggered
+      && MATRIX_CRASH_MODE === "after-incremental-sync-accept"
+      && incrementalSync
+      && requestedBatch === cryptoSyncToAcknowledge?.nextBatch
+    );
+    if (shouldCrashIncrementalSync) sourceUrl.searchParams.set("timeout", "0");
+    const request = typeof input === "object" && input !== null && "url" in input
+      ? new Request(new Request(sourceUrl, input), init)
+      : new Request(sourceUrl, init);
+    if (shouldCrashRoomSend && MATRIX_CRASH_MODE === "before-room-fetch") {
       crashTriggered = true;
+      const content = await request.clone().json();
+      const pathUrl = new URL(sourceUrl);
+      pathUrl.searchParams.delete("access_token");
       process.send?.({
         type: "crash-boundary",
         mode: MATRIX_CRASH_MODE,
+        heldRequest: {
+          path: `${pathUrl.pathname}${pathUrl.search}`,
+          content,
+        },
       });
       return await new Promise(() => {});
     }
-    const response = typeof input === "object" && input !== null && "url" in input
-      ? await fetch(new Request(sourceUrl, input), init)
-      : await fetch(sourceUrl, init);
-    if (shouldCrash && MATRIX_CRASH_MODE === "after-room-accept") {
+    const response = await fetch(request);
+    if (shouldCrashRoomSend && MATRIX_CRASH_MODE === "after-room-accept") {
       crashTriggered = true;
       const payload = await response.clone().json();
       process.send?.({
@@ -69,6 +120,41 @@ function makeTransport() {
         eventId: payload.event_id,
       });
       return await new Promise(() => {});
+    }
+    if (shouldCrashIncrementalSync) {
+      crashTriggered = true;
+      process.send?.({
+        type: "crash-boundary",
+        mode: MATRIX_CRASH_MODE,
+        acknowledgedBatch: requestedBatch,
+        toDeviceEventCount: cryptoSyncToAcknowledge.eventCount,
+        seedEventId: cryptoSyncToAcknowledge.seedEventId,
+      });
+      return await new Promise(() => {});
+    }
+    if (shouldHoldIncrementalSync) {
+      const payload = await response.clone().json();
+      const cryptoEvents = (payload.to_device?.events ?? []).filter((event) => (
+        event?.type === "m.room.encrypted"
+        && event?.sender === MATRIX_ALLOWED_USER_ID
+      ));
+      const timelineEvents = (
+        payload.rooms?.join?.[MATRIX_ROOM_ID]?.timeline?.events ?? []
+      );
+      if (!timelineEvents.some((event) => event?.event_id === expectedSeedEventId)) {
+        throw new Error("Held Matrix sync did not contain the expected seed event");
+      }
+      if (!cryptoEvents.length) {
+        throw new Error("Held Matrix sync did not contain peer encryption key material");
+      }
+      if (typeof payload.next_batch !== "string") {
+        throw new Error("Held Matrix sync did not contain next_batch");
+      }
+      cryptoSyncToAcknowledge = {
+        nextBatch: payload.next_batch,
+        eventCount: cryptoEvents.length,
+        seedEventId: expectedSeedEventId,
+      };
     }
     return response;
   };
@@ -106,11 +192,36 @@ async function waitUntil(predicate, label, timeoutMs = 30_000) {
 async function handleCommand(command) {
   switch (command.action) {
     case "sendMessage":
-      crashArmed = Boolean(MATRIX_CRASH_MODE);
+      crashArmed = (
+        MATRIX_CRASH_MODE === "before-room-fetch"
+        || MATRIX_CRASH_MODE === "after-room-accept"
+      );
       return await adapter.sendMessage({
         chatId: MATRIX_ROOM_ID,
         text: command.text,
       });
+    case "armSyncCrash":
+      if (MATRIX_CRASH_MODE !== "after-incremental-sync-accept") {
+        throw new Error("Matrix bot sync crash mode is not configured");
+      }
+      if (crashArmed) throw new Error("Matrix bot sync crash is already armed");
+      crashArmed = true;
+      await syncHeld;
+      return {};
+    case "releaseSyncCrash":
+      if (
+        MATRIX_CRASH_MODE !== "after-incremental-sync-accept"
+        || !crashArmed
+        || cryptoSyncToAcknowledge !== null
+      ) {
+        throw new Error("Matrix bot sync crash is not waiting for release");
+      }
+      if (typeof command.eventId !== "string" || !command.eventId) {
+        throw new Error("Matrix bot sync crash release requires an event ID");
+      }
+      expectedSeedEventId = command.eventId;
+      releaseHeldSync();
+      return {};
     case "waitForMessage":
       return await waitUntil(
         () => messages.find(({ messageId, text }) => (

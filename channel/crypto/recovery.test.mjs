@@ -17,7 +17,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { indexedDB } from "fake-indexeddb";
-import { installTestCryptoDatabase } from "./crypto-db-test-fixture.mjs";
+import {
+  installTestCryptoDatabase,
+  TEST_CRYPTO_DATABASE_NAME,
+} from "./crypto-db-test-fixture.mjs";
 import {
   clearCryptoStateActive,
   clearInMemoryCryptoState,
@@ -48,6 +51,14 @@ async function makeState(label) {
   await prepareCryptoStateIdentity(stateDir, identity, { allowBootstrap: true });
   await installTestCryptoDatabase();
   await persistCryptoState(stateDir);
+  const database = await request(indexedDB.open(TEST_CRYPTO_DATABASE_NAME, 12));
+  const transaction = database.transaction("core", "readwrite");
+  transaction.objectStore("core").put({ label }, "recovery-generation");
+  await new Promise((resolve, reject) => {
+    transaction.addEventListener("complete", resolve, { once: true });
+    transaction.addEventListener("error", () => reject(transaction.error), { once: true });
+  });
+  database.close();
   await persistCryptoState(stateDir);
   return stateDir;
 }
