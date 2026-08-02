@@ -358,6 +358,101 @@ try {
     assert.equal(existsSync(join(stateDir, "crypto-idb.snapshot")), true);
   });
 
+  await test("encrypted startup only enables an existing backup and installs secret-storage callbacks", async () => {
+    const stateDir = makeCryptoStateDir("backup-startup");
+    const calls = [];
+    const backupInfo = {
+      version: "4\u009b[2Kforged",
+      algorithm: "m.megolm_backup.v1.curve25519-aes-sha2",
+      auth_data: { public_key: "public" },
+      count: 2,
+    };
+    const crypto = {
+      checkKeyBackupAndEnable: async () => {
+        calls.push("checkKeyBackupAndEnable");
+        return {
+          backupInfo,
+          trustInfo: { trusted: true, matchesDecryptionKey: false },
+        };
+      },
+      isKeyBackupTrusted: async () => ({ trusted: true, matchesDecryptionKey: false }),
+      getActiveSessionBackupVersion: async () => backupInfo.version,
+      getSessionBackupPrivateKey: async () => null,
+      isSecretStorageReady: async () => false,
+      isCrossSigningReady: async () => false,
+      getCrossSigningStatus: async () => ({ privateKeysInSecretStorage: false }),
+      getDeviceVerificationStatus: async () => ({
+        signedByOwner: false,
+        crossSigningVerified: false,
+        localVerified: false,
+      }),
+      bootstrapSecretStorage: async () => calls.push("bootstrapSecretStorage"),
+      resetKeyBackup: async () => calls.push("resetKeyBackup"),
+    };
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      getCrypto: () => crypto,
+      getKeyBackupVersion: async () => backupInfo,
+    });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    const originalWarn = console.warn;
+    const warningLines = [];
+    try {
+      console.warn = (...args) => warningLines.push(args.map(String).join(" "));
+      await made.adapter.start();
+      assert.deepEqual(calls, ["checkKeyBackupAndEnable"]);
+      const createOptions = made.getCreateOptions()[0];
+      assert.equal(typeof createOptions.cryptoCallbacks.getSecretStorageKey, "function");
+      assert.equal(typeof createOptions.cryptoCallbacks.cacheSecretStorageKey, "function");
+      assert.equal(made.adapter.cryptoRecoveryStatus.serverVersion, backupInfo.version);
+      assert.equal(made.adapter.cryptoRecoveryStatus.backupUsable, false);
+      assert.doesNotMatch(warningLines.join("\n"), /\u009b/);
+    } finally {
+      console.warn = originalWarn;
+      await made.adapter.stop();
+    }
+  });
+
+  await test("crypto recovery timeout preserves the control guard until the operation settles", async () => {
+    const stateDir = makeCryptoStateDir("control-timeout");
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    let releaseOperation;
+    let stopped = false;
+    try {
+      await made.adapter.start();
+      await assert.rejects(
+        () => made.adapter.runCryptoControl(
+          () => new Promise((resolveOperation) => { releaseOperation = resolveOperation; }),
+          { timeoutMs: 20 },
+        ),
+        /Matrix encryption recovery operation timed out after 20ms/,
+      );
+      assert.ok(made.adapter.cryptoControlPromise);
+      await assert.rejects(
+        () => made.adapter.runCryptoControl(async () => undefined),
+        /Another Matrix encryption recovery operation is already running/,
+      );
+      let stopResolved = false;
+      const stopping = made.adapter.stop().then(() => { stopResolved = true; });
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+      assert.equal(stopResolved, false);
+      releaseOperation();
+      await stopping;
+      stopped = true;
+      assert.equal(made.adapter.cryptoControlPromise, null);
+    } finally {
+      releaseOperation?.();
+      if (!stopped) await made.adapter.stop();
+    }
+  });
+
   await test("encrypted incremental sync checkpoints before acknowledging crypto state", async () => {
     const stateDir = makeCryptoStateDir("sync-barriers");
     const client = makeEncryptedClient({
@@ -2282,6 +2377,23 @@ try {
         { method: "POST" },
       );
       assert.deepEqual(order, ["persist", "fetch"]);
+      order.length = 0;
+      for (const [path, method] of [
+        ["/_matrix/client/v3/keys/device_signing/upload", "POST"],
+        ["/_matrix/client/v3/keys/signatures/upload", "POST"],
+        ["/_matrix/client/v3/user/%40matrix%3Aexample.org/account_data/m.secret_storage.default_key", "PUT"],
+        ["/_matrix/client/v3/room_keys/version", "POST"],
+        ["/_matrix/client/v3/room_keys/keys?version=4", "PUT"],
+      ]) {
+        await fetchFn(`https://example.org${path}`, { method });
+        assert.deepEqual(order, ["persist", "fetch"], `${path} uses a crypto write-ahead barrier`);
+        order.length = 0;
+      }
+      await fetchFn(
+        "https://example.org/_matrix/client/v3/room_keys/version",
+        { method: "GET" },
+      );
+      assert.deepEqual(order, ["fetch"], "read-only backup status does not force a snapshot");
       order.length = 0;
       await fetchFn(
         "https://example.org/%ZZ/proxy/_matrix/client/v3/rooms/%21room%3Aexample.org/send/m.room.encrypted/txn",

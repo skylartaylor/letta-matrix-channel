@@ -6,16 +6,22 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MatrixEvent } from "matrix-js-sdk";
 import {
   inspectCryptoStateRecovery,
   recoverCryptoStateAfterCrash,
 } from "../crypto/idb-state.mjs";
+import {
+  readRecoveryKeyExport,
+  writeRecoveryKeyExport,
+} from "../crypto/recovery-key-store.mjs";
 
 const SYNAPSE_IMAGE = process.env.MATRIX_SYNAPSE_IMAGE
   ?? "matrixdotorg/synapse@sha256:6345789f58048687f3024a99d3d59b5444fc9cc1de61d2947000cbac89573fcb";
@@ -36,6 +42,7 @@ const testRoot = mkdtempSync(join(cacheRoot, "letta-matrix-e2ee-"));
 const synapseState = join(testRoot, "synapse");
 const botState = join(testRoot, "bot-crypto");
 const replacementBotState = join(testRoot, "bot-crypto-replacement");
+const recoveryKeyExportPath = join(testRoot, "bot-recovery-key.json");
 mkdirSync(synapseState, { mode: 0o700 });
 
 let encryptedAdapter = null;
@@ -385,6 +392,13 @@ async function queryDeviceKeys(baseUrl, token, userId, deviceId) {
     });
     return response.device_keys?.[userId]?.[deviceId]?.keys;
   }, `Matrix device keys for ${userId} ${deviceId}`);
+}
+
+async function waitForBackupSessions(baseUrl, token, minimum = 1) {
+  return await waitUntil(async () => {
+    const backup = await matrixRequest(baseUrl, "/_matrix/client/v3/room_keys/version", { token });
+    return Number.isSafeInteger(backup.count) && backup.count >= minimum ? backup : null;
+  }, `Matrix room-key backup to contain at least ${minimum} session(s)`);
 }
 
 async function waitForDeviceAbsent(baseUrl, token, userId, deviceId) {
@@ -821,6 +835,18 @@ try {
     /crypto state is already in use by process/,
   );
 
+  const setupRecoveryStatus = await encryptedAdapter.setupEncryptionRecovery({
+    password: PASSWORD,
+    exportRecoveryKey: async (payload) => {
+      writeRecoveryKeyExport(recoveryKeyExportPath, payload);
+    },
+  });
+  assert.equal(setupRecoveryStatus.backupUsable, true);
+  assert.equal(setupRecoveryStatus.secretStorageReady, true);
+  assert.equal(setupRecoveryStatus.crossSigningReady, true);
+  assert.equal(setupRecoveryStatus.recoveryKeyStored, true);
+  const recoveryKeyExport = readRecoveryKeyExport(recoveryKeyExportPath);
+
   const inboundText = "matrix real encrypted inbound";
   const peerSent = await peerRequest("sendMessage", { roomId, text: inboundText });
   await waitUntil(() => inbound.some(({ messageId }) => messageId === peerSent.eventId), "adapter decrypted inbound");
@@ -830,6 +856,11 @@ try {
   assert.equal(rawInbound.type, "m.room.encrypted");
   assert.equal(rawInbound.content.algorithm, "m.megolm.v1.aes-sha2");
   assert.equal("body" in rawInbound.content, false);
+  const initialBackup = await waitForBackupSessions(
+    httpBaseUrl,
+    botLogin.access_token,
+  );
+  assert.equal(initialBackup.version, setupRecoveryStatus.serverVersion);
 
   const outboundText = "real encrypted outbound";
   const adapterSent = await encryptedAdapter.sendMessage({ chatId: roomId, text: outboundText });
@@ -1005,6 +1036,33 @@ try {
   );
   assert.equal(replacementLogin.user_id, BOT_USER_ID);
   assert.equal(replacementLogin.device_id, REPLACEMENT_BOT_DEVICE_ID);
+  const storedRecoveryKeyPath = join(botState, "recovery-key.json");
+  const heldRecoveryKeyPath = join(botState, "recovery-key.json.held");
+  let replacementWritesAgainstRecoveryState = 0;
+  replacementAdapter = channelPlugin.createAdapter({
+    ...account,
+    config: {
+      ...account.config,
+      bot_token: replacementLogin.access_token,
+    },
+  });
+  replacementAdapter.networkFetch = makeTransport(httpBaseUrl, (url) => {
+    if (
+      /\/keys\/upload$/.test(url.pathname)
+      || /\/sendToDevice\/m\.room\.encrypted\//.test(url.pathname)
+      || /\/rooms\/[^/]+\/send\/m\.room\.encrypted\//.test(url.pathname)
+    ) {
+      replacementWritesAgainstRecoveryState += 1;
+    }
+  });
+  await assert.rejects(
+    () => replacementAdapter.start(),
+    /recovery key identity does not match the authenticated encrypted account/,
+  );
+  assert.equal(replacementWritesAgainstRecoveryState, 0);
+  await replacementAdapter.stop();
+
+  renameSync(storedRecoveryKeyPath, heldRecoveryKeyPath);
   let replacementWritesAgainstOldState = 0;
   replacementAdapter = channelPlugin.createAdapter({
     ...account,
@@ -1028,6 +1086,7 @@ try {
   );
   assert.equal(replacementWritesAgainstOldState, 0);
   await replacementAdapter.stop();
+  renameSync(heldRecoveryKeyPath, storedRecoveryKeyPath);
 
   const replacementInbound = [];
   replacementAdapter = channelPlugin.createAdapter({
@@ -1052,6 +1111,38 @@ try {
     userId: BOT_USER_ID,
     deviceId: REPLACEMENT_BOT_DEVICE_ID,
   });
+  const unavailableHistoricalEvent = new MatrixEvent({ ...rawInbound, room_id: roomId });
+  await replacementAdapter.client.decryptEventIfNeeded(unavailableHistoricalEvent);
+  assert.equal(
+    unavailableHistoricalEvent.isDecryptionFailure(),
+    true,
+    "historical event must be unavailable before backup restore",
+  );
+  const wrongRecoveryKey = await replacementAdapter.client
+    .getCrypto()
+    .createRecoveryKeyFromPassphrase();
+  await assert.rejects(
+    () => replacementAdapter.restoreEncryptionRecovery({
+      recoveryKeyExport: {
+        ...recoveryKeyExport,
+        encodedPrivateKey: wrongRecoveryKey.encodedPrivateKey,
+      },
+    }),
+    /does not unlock the account's secret storage/,
+  );
+  const restoredRecovery = await replacementAdapter.restoreEncryptionRecovery({
+    recoveryKeyExport,
+  });
+  assert.ok(restoredRecovery.imported >= 1, "replacement device imports at least one backed-up session");
+  assert.equal(restoredRecovery.status.serverVersion, initialBackup.version);
+  assert.equal(restoredRecovery.status.backupUsable, true);
+  assert.equal(restoredRecovery.status.crossSigningReady, true);
+
+  const historicalEvent = new MatrixEvent({ ...rawInbound, room_id: roomId });
+  await replacementAdapter.client.decryptEventIfNeeded(historicalEvent);
+  assert.equal(historicalEvent.getContent().body, inboundText);
+  assert.equal(historicalEvent.getContent().msgtype, "m.text");
+
   const replacementKeys = await queryDeviceKeys(
     httpBaseUrl,
     peerLogin.access_token,

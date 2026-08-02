@@ -1,6 +1,12 @@
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { createRecoveryKeyStore } from "./crypto/recovery-key-store.mjs";
+import {
+  enableExistingCryptoRecovery,
+  getCryptoRecoveryStatus,
+  restoreCryptoRecovery,
+  setupCryptoRecovery,
+} from "./crypto/recovery.mjs";
+import { cryptoStateDirectory } from "./crypto/paths.mjs";
 import { startCryptoRuntime } from "./crypto/runtime.mjs";
 
 const CHANNEL_ID = "matrix";
@@ -9,6 +15,7 @@ const MAX_TRACKED_THREAD_TIPS = 500;
 const DECRYPTED_EVENT_NAME = "Event.decrypted";
 const WHOAMI_RETRY_DELAYS_MS = [500, 1500];
 const WHOAMI_TIMEOUT_MS = 10_000;
+const CRYPTO_CONTROL_TIMEOUT_MS = 5 * 60_000;
 const TYPING_TIMEOUT_MS = 30_000;
 const TYPING_REFRESH_MS = 10_000;
 const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
@@ -29,7 +36,6 @@ const SHIELD_REASON_NAMES = [
   "authenticity_not_guaranteed",
   "mismatched_sender_key",
 ];
-const CHANNEL_DIR = dirname(fileURLToPath(import.meta.url));
 const STARTUP_CLEANUP_COMPLETE = Symbol("matrix-startup-cleanup-complete");
 // Mirrors Letta Code 0.29.x channel slash commands; unknown "/words" stay agent text.
 const COMMAND_WORDS = new Set([
@@ -43,7 +49,7 @@ function nonEmpty(value) {
 
 function safeLogToken(value, fallback = "unknown") {
   const text = nonEmpty(String(value ?? "")) ?? fallback;
-  return text.replace(/[\u0000-\u001f\u007f\s]+/g, "_").slice(0, 160);
+  return text.replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, "_").slice(0, 160);
 }
 
 function roomIsEncrypted(room) {
@@ -53,11 +59,13 @@ function roomIsEncrypted(room) {
   );
 }
 
-function cryptoWriteAheadRequest(input) {
+function cryptoWriteAheadRequest(input, init) {
   const rawUrl = typeof input === "string" || input instanceof URL
     ? String(input)
     : input?.url;
   if (!rawUrl) return false;
+  const method = String(init?.method ?? input?.method ?? "GET").toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return false;
   let segments;
   try {
     segments = new URL(rawUrl).pathname.split("/");
@@ -78,6 +86,16 @@ function cryptoWriteAheadRequest(input) {
       segment === "keys"
       && segments[index + 1] === "upload"
     )
+    || (
+      segment === "keys"
+      && (
+        segments[index + 1] === "device_signing"
+        || segments[index + 1] === "signatures"
+      )
+      && segments[index + 2] === "upload"
+    )
+    || segment === "room_keys"
+    || segment === "account_data"
   ));
 }
 
@@ -145,18 +163,9 @@ function loadSdk() {
   return require("matrix-js-sdk");
 }
 
-function stateAccountComponent(accountId) {
-  const value = String(accountId ?? "");
-  if (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && value !== "." && value !== "..") {
-    return value;
-  }
-  return `~${Buffer.from(value).toString("base64url") || "empty"}`;
-}
-
-function cryptoStateDirectory(accountId, configuredStateDir) {
-  return configuredStateDir
-    ? resolve(CHANNEL_DIR, configuredStateDir)
-    : resolve(CHANNEL_DIR, "state", stateAccountComponent(accountId));
+function loadRecoveryKeyDecoder() {
+  const require = createRequire(new URL("./runtime/package.json", import.meta.url));
+  return require("matrix-js-sdk/lib/crypto-api/recovery-key.js").decodeRecoveryKey;
 }
 
 function parseSettings(account) {
@@ -318,6 +327,12 @@ class MatrixChannelAdapter {
     this.account = account;
     this.settings = parseSettings(account);
     this.sdk = loadSdk();
+    this.decodeRecoveryKey = loadRecoveryKeyDecoder();
+    this.cryptoStateDir = cryptoStateDirectory(
+      account.accountId,
+      this.settings.encryptionStateDir,
+    );
+    this.recoveryKeyStore = createRecoveryKeyStore({ stateDir: this.cryptoStateDir });
     this.networkFetch = globalThis.fetch?.bind(globalThis);
     this.clientFetchToken = null;
     this.client = this.createClient();
@@ -341,6 +356,9 @@ class MatrixChannelAdapter {
     this.pendingEncryptedDeliveries = new Map();
     this.pendingRoomSends = new Map();
     this.cryptoRuntime = null;
+    this.cryptoIdentity = null;
+    this.cryptoRecoveryStatus = null;
+    this.cryptoControlPromise = null;
     this.pendingRuntimeStop = null;
     this.runtimeCleanupError = null;
     this.encryptedClientConsumed = false;
@@ -358,6 +376,7 @@ class MatrixChannelAdapter {
       baseUrl: this.settings.homeserverUrl,
       accessToken: this.settings.accessToken,
       fetchFn: (...args) => this.fetchMatrix(fetchToken, ...args),
+      cryptoCallbacks: this.recoveryKeyStore.cryptoCallbacks,
     });
   }
 
@@ -383,7 +402,7 @@ class MatrixChannelAdapter {
         throw new Error("refusing stale Matrix incremental sync after crypto checkpoint");
       }
     }
-    if (cryptoWriteAheadRequest(input)) {
+    if (cryptoWriteAheadRequest(input, init)) {
       const runtime = this.cryptoRuntime;
       if (
         fetchToken !== this.clientFetchToken
@@ -523,16 +542,19 @@ class MatrixChannelAdapter {
         cryptoAttempted = true;
         this.encryptedClientConsumed = true;
         const homeserverUrl = new URL(this.settings.homeserverUrl).href;
+        const cryptoIdentity = {
+          homeserverUrl,
+          userId: selfUserId,
+          deviceId,
+          accountId: String(this.accountId),
+        };
+        this.recoveryKeyStore.setIdentity(cryptoIdentity);
+        this.cryptoIdentity = cryptoIdentity;
         runtime = await startCryptoRuntime({
           client,
           accountKey: `${homeserverUrl}\u0000${selfUserId}\u0000${this.accountId}`,
-          stateDir: cryptoStateDirectory(this.accountId, this.settings.encryptionStateDir),
-          identity: {
-            homeserverUrl,
-            userId: selfUserId,
-            deviceId,
-            accountId: String(this.accountId),
-          },
+          stateDir: this.cryptoStateDir,
+          identity: cryptoIdentity,
         });
         clientMustStop = true;
         if (epoch !== this.epoch) {
@@ -557,6 +579,52 @@ class MatrixChannelAdapter {
           return;
         }
         this.cryptoRuntime = runtime;
+        try {
+          this.cryptoRecoveryStatus = await enableExistingCryptoRecovery({
+            client,
+            recoveryKeyStore: this.recoveryKeyStore,
+            identity: cryptoIdentity,
+            persist: () => runtime.persist(),
+          });
+          if (
+            this.cryptoRecoveryStatus.serverVersion
+            && !this.cryptoRecoveryStatus.backupUsable
+          ) {
+            console.warn(
+              `[${CHANNEL_ID}] Matrix room-key backup exists but is not usable`
+              + ` account=${safeLogToken(this.accountId)}`
+              + ` version=${safeLogToken(this.cryptoRecoveryStatus.serverVersion)}`,
+            );
+          }
+        } catch (recoveryError) {
+          this.cryptoRecoveryStatus = { error: recoveryError };
+          console.warn(
+            `[${CHANNEL_ID}] Matrix room-key backup startup check failed`
+            + ` account=${safeLogToken(this.accountId)}:`,
+            recoveryError,
+          );
+        }
+        if (epoch !== this.epoch) {
+          const cleanup = await this.cleanupClientStart({
+            client,
+            runtime,
+            syncListener,
+            timelineListener,
+            decryptedListener,
+            syncListenerAttached,
+            timelineListenerAttached,
+            decryptedListenerAttached,
+            clientMustStop,
+          });
+          if (cleanup.errors.length) {
+            throw this.lifecycleCleanupFailure(
+              cleanup.errors,
+              "Matrix cancelled recovery-check cleanup failed",
+              { permanent: cleanup.permanent },
+            );
+          }
+          return;
+        }
       }
       const acceptsEvents = () => (
         this.acceptedEpoch === epoch
@@ -737,6 +805,13 @@ class MatrixChannelAdapter {
   }
 
   async performStop() {
+    if (this.cryptoControlPromise) {
+      try {
+        await this.cryptoControlPromise;
+      } catch {
+        // Control-plane failures do not bypass mandatory client/runtime cleanup.
+      }
+    }
     if (this.pendingRuntimeStop) {
       const runtime = this.pendingRuntimeStop;
       try {
@@ -1163,6 +1238,83 @@ class MatrixChannelAdapter {
       );
       return false;
     }
+  }
+
+  runCryptoControl(operation, { timeoutMs = CRYPTO_CONTROL_TIMEOUT_MS } = {}) {
+    if (!this.settings.encryptionEnabled) {
+      return Promise.reject(new Error("Matrix encryption recovery is unavailable while encryption is disabled"));
+    }
+    if (!this.running || !this.desiredRunning || !this.cryptoRuntime || !this.cryptoIdentity) {
+      return Promise.reject(new Error("Matrix encryption recovery requires a running encrypted adapter"));
+    }
+    if (this.cryptoControlPromise) {
+      return Promise.reject(new Error("Another Matrix encryption recovery operation is already running"));
+    }
+    const client = this.client;
+    const runtime = this.cryptoRuntime;
+    const identity = this.cryptoIdentity;
+    const pending = (async () => {
+      const result = await operation({ client, runtime, identity });
+      if (this.client !== client || this.cryptoRuntime !== runtime) {
+        throw new Error("Matrix encryption recovery client changed during the operation");
+      }
+      return result;
+    })();
+    this.cryptoControlPromise = pending;
+    void pending.finally(() => {
+      if (this.cryptoControlPromise === pending) this.cryptoControlPromise = null;
+    }).catch(() => undefined);
+    return withTimeout(pending, timeoutMs, "Matrix encryption recovery operation");
+  }
+
+  getEncryptionRecoveryStatus() {
+    return this.runCryptoControl(async ({ client, runtime, identity }) => {
+      const status = await getCryptoRecoveryStatus({
+        client,
+        recoveryKeyStore: this.recoveryKeyStore,
+        identity,
+      });
+      await runtime.persist();
+      this.cryptoRecoveryStatus = status;
+      return status;
+    });
+  }
+
+  setupEncryptionRecovery({
+    recoveryKeyExport = null,
+    exportRecoveryKey,
+    password,
+  } = {}) {
+    return this.runCryptoControl(async ({ client, runtime, identity }) => {
+      const status = await setupCryptoRecovery({
+        client,
+        recoveryKeyStore: this.recoveryKeyStore,
+        identity,
+        recoveryKeyExport,
+        exportRecoveryKey,
+        password,
+        decodeRecoveryKey: this.decodeRecoveryKey,
+        persist: () => runtime.persist(),
+      });
+      this.cryptoRecoveryStatus = status;
+      return status;
+    });
+  }
+
+  restoreEncryptionRecovery({ recoveryKeyExport = null, progressCallback } = {}) {
+    return this.runCryptoControl(async ({ client, runtime, identity }) => {
+      const result = await restoreCryptoRecovery({
+        client,
+        recoveryKeyStore: this.recoveryKeyStore,
+        identity,
+        recoveryKeyExport,
+        decodeRecoveryKey: this.decodeRecoveryKey,
+        persist: () => runtime.persist(),
+        progressCallback,
+      });
+      this.cryptoRecoveryStatus = result.status;
+      return result;
+    });
   }
 
   async handleTimelineEvent(

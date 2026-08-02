@@ -60,10 +60,28 @@ beside its crypto state and verifies that they match before restore. The
 default directory is durable `channel/state/<account>`, and configured relative
 paths are resolved from `channel/`, not the listener's process directory.
 
-Cross-signing bootstrap, recovery-key upload, and automatic trust repair are
-not v1 features. If state is missing or identity metadata does not match, the
-adapter fails with a specific recovery error. It must not silently create a new
-device over an existing state directory.
+Cross-signing, secret storage, and room-key backup are managed through an
+explicit offline control command. Normal startup only checks and enables an
+existing usable backup; it never creates, replaces, or resets recovery state.
+Initial setup exports the secret-storage recovery key before server mutation,
+bootstraps cross-signing, and creates a backup only when none exists. Existing
+cross-signing or backup state must be recoverable before setup continues.
+
+The local recovery-key copy is identity-bound and mode `0600`; an operator must
+also retain the exported key outside the disposable crypto-state directory and
+preferably off-machine. A supplied recovery key remains an in-memory candidate
+until it is validated against server secret storage, so a wrong file cannot
+poison durable local state. Replacement-device restore imports the full room-key
+backup without changing its version, recovers the published cross-signing
+identity, verifies the recovered master-key ID has not changed, and signs the
+new device. Partial key imports fail the control operation. Backup reset is
+intentionally absent.
+
+Room-key backup complements the host-local IndexedDB snapshot; it does not make
+snapshot rollback safe and cannot recreate the old Matrix device or its Olm
+state. If state is missing or identity metadata does not match, the adapter
+fails with a specific recovery error. It must not silently create a new device
+over an existing state directory.
 
 ## Port phases
 
@@ -149,8 +167,13 @@ event; the real peer decrypts both, guarding against outbound Megolm-index
 reuse. The gate also covers corrupt-current fail-closed behavior, new-device
 bootstrap on an unused state directory with old-device revocation,
 cross-process state-lock enforcement, and no plaintext room-send request before
-or after sync.
+or after sync. It now also creates a real server room-key backup, confirms that
+new inbound session material is uploaded, rejects a valid but wrong recovery
+key without poisoning local state, restores the unchanged backup onto a fresh
+device, and decrypts a historical ciphertext using the restored session.
 
 A missing or corrupt current snapshot is not recoverable as the same device.
 The operator must revoke that device through a trusted Matrix client, obtain a
-token bound to a new device ID, and bootstrap an unused state directory.
+token bound to a new device ID, and bootstrap an unused state directory. When a
+validated room-key backup exists, the replacement device can then restore its
+backed-up historical Megolm sessions from the external recovery-key export.
