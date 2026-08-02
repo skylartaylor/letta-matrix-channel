@@ -160,6 +160,8 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// The pinned SDK does not expose its sync-loop promise. Retain it on SyncApi
+// so shutdown can prove the loop settled even when no STOPPED event is emitted.
 export function installMatrixSyncLoopTracking(SyncApi) {
   const prototype = SyncApi?.prototype;
   const originalSync = prototype?.sync;
@@ -369,6 +371,9 @@ async function waitForCryptoDrainFlag(target, property, {
   }
 }
 
+// Settle registered sends, then stop sync and every Rust-crypto worker before
+// MatrixClient closes its crypto backend. Unknown SDK shapes or timeouts make
+// shutdown unprovable, so callers quarantine the runtime instead of restarting.
 export async function drainMatrixClientCryptoWork(
   client,
   {

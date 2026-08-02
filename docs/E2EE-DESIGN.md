@@ -3,177 +3,222 @@
 ## Decision
 
 Adapt the minimum coherent Matrix Rust/WASM crypto runtime from OpenClaw's MIT
-Matrix extension, while keeping a Letta-native channel adapter. The channel
-continues to use `matrix-js-sdk`; it does not use libolm or the vulnerable
-`matrix-bot-sdk` transport stack.
+Matrix extension while keeping a Letta-native channel adapter. The channel
+continues to use `matrix-js-sdk`; it does not use libolm or `matrix-bot-sdk`.
 
-This is an adaptation project, not a one-line `initRustCrypto()` flag. OpenClaw
-ships crypto bootstrap, fake-IndexedDB persistence, decryption handling,
-verification, and restart recovery as a subsystem. Our implementation must do
-the same within a smaller Letta-oriented boundary.
+Matrix crypto is a lifecycle subsystem, not a one-line `initRustCrypto()` flag.
+The adapter owns bootstrap, host-local persistence, encrypted event delivery,
+shutdown, and explicit recovery as one fail-closed boundary. OpenClaw-derived
+files and their attribution are listed in
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 
 ## Non-negotiable invariants
 
 1. Encryption is off by default. Plaintext mode continues to reject sends to
    known encrypted rooms.
-2. An encrypted adapter restores crypto state and calls `initRustCrypto()`
-   before Matrix sync starts. It never falls back to plaintext if that fails.
-3. The pinned Matrix SDK has process-global Rust-crypto IndexedDB names. v1
-   therefore permits **one encrypted Matrix account per listener process**.
-   A second encrypted account fails at startup rather than sharing state.
-   Snapshot, restore, and clear operations are restricted to the pinned SDK's
-   two crypto database names and validate its expected schema and Olm account.
-4. The crypto state directory is exclusive to one account. A crash-safe
-   PID/liveness lock prevents concurrent use, and a separate transition gate
-   serializes stale-owner replacement, publication, and release. State is mode
-   `0700`; snapshots and identity metadata are mode `0600`.
-   The state directory must be host-local; shared or network-mounted crypto
-   state is unsupported because PID liveness has only host-local meaning.
-   The gate is deliberately not auto-reclaimed after its owner dies: deleting
-   the serialization primitive after a stale read could delete a live
-   successor's gate and reintroduce the takeover race. Live contention reports
-   the owning PID and asks the caller to retry; a dead or malformed transition
-   gate fails closed for operator recovery.
-5. State persistence serializes binary IndexedDB records without JSON loss,
-   retains a previous generation as forensic evidence only, uses
-   one readonly transaction per crypto database plus atomic file replacement,
-   and serializes periodic, explicit-barrier, and shutdown checkpoints.
-   Publishing a new snapshot never removes the authoritative current path:
-   the old current is hard-linked through a temporary previous candidate
-   before the new temporary atomically replaces current.
-   Previous-generation promotion is forbidden, whether automatic or manual,
-   because ratchet rollback can reuse keys or outbound message indices.
-6. Outbound messages are allowed only after initial sync has loaded room
-   encryption state and while the SDK reports that state as current. Any
-   reconnect, catch-up, stopped, or error state closes the outbound gate until
-   sync is current again.
-7. Undecryptable events never become fake plaintext. They get bounded handling
-   and a safe operator diagnostic containing IDs/reason only.
+2. An encrypted adapter resolves a stable Matrix device, restores crypto state,
+   and calls `initRustCrypto()` before sync starts. It never falls back to
+   plaintext if any of those steps fail.
+3. The pinned Matrix SDK uses process-global Rust-crypto IndexedDB names. Only
+   one encrypted Matrix account may run in a listener process. A second account
+   fails at startup rather than sharing state.
+4. One host-local state directory belongs to one homeserver, channel account,
+   Matrix user, and Matrix device. Identity mismatches and suspicious missing
+   metadata fail closed.
+5. The state directory has one live owner. Locks, stale-owner takeover, active
+   markers, and snapshot publication must not delete or release a successor's
+   ownership.
+6. The current snapshot is authoritative. A previous generation is retained as
+   forensic evidence only and is never promoted, because rollback could reuse
+   ratchet state or outbound message indices.
+7. Outbound messages remain closed until initial sync has loaded current room
+   encryption state. Reconnect, catch-up, stopped, and error states close the
+   gate again.
+8. Undecryptable events never become placeholder plaintext. Diagnostics contain
+   identifiers and reasons, not message content.
+9. An encrypted client is not reused after `stopClient()`. A clean restart
+   creates a new SDK client; an unproven shutdown quarantines the runtime.
+
+## State and ownership
+
+The default crypto state directory is durable
+`channel/state/<accountId>`. A configured relative `stateDir` also resolves
+from the channel directory, never from the listener's working directory.
+Shared or network-mounted state is unsupported because PID liveness is only
+meaningful on the local host.
+
+State directories are mode `0700`; snapshots, identity metadata, recovery-key
+material, and active markers are mode `0600`. Identity metadata binds the
+snapshot to:
+
+- canonical homeserver URL;
+- Letta channel account ID;
+- Matrix user ID; and
+- Matrix device ID.
+
+The first encrypted startup may bootstrap only when it creates the state
+directory itself. A pre-existing empty directory is suspicious and fails
+closed. Later startups require both matching identity metadata and a valid
+current snapshot.
+
+The account lock carries an ownership token. Dead-owner takeover is serialized
+through an atomic transition gate and rename so concurrent reclaimers cannot
+delete each other's locks. The transition gate is deliberately not reclaimed
+automatically after its own owner dies: removing that serialization primitive
+after a stale read could remove a live successor's gate. A dead or malformed
+gate therefore requires operator inspection.
+
+## Startup and lifecycle
+
+Encrypted startup proceeds in this order:
+
+1. authenticate with `/whoami` and require both `user_id` and `device_id`;
+2. set the SDK client's user and device credentials;
+3. acquire process and state-directory ownership;
+4. validate identity metadata and restore the current snapshot, or perform a
+   permitted first bootstrap;
+5. write the active-runtime marker;
+6. initialize Rust crypto;
+7. publish the mandatory first snapshot;
+8. inspect and enable an existing usable room-key backup; and
+9. attach event listeners and start sync.
+
+`stop()` invalidates the startup epoch immediately. If it arrives while an
+asynchronous startup step is in flight, startup performs the same guarded
+cleanup and never starts sync afterward. Concurrent `start()` and `stop()` calls
+share one reconciliation loop; startup cannot report success while cleanup is
+still pending.
+
+Clean shutdown drains work in this order:
+
+1. registered encrypted room sends;
+2. the Matrix sync loop;
+3. backup upload, backup download, key claim, and outgoing-request workers;
+4. the Matrix client and its Rust-crypto backend via `stopClient()`;
+5. the final serialized snapshot;
+6. the owned active marker, state lock, and process guard.
+
+The pinned SDK does not expose all of these lifecycle promises publicly, so the
+adapter validates the expected internal shapes before relying on them. A
+timeout or unknown shape makes shutdown unprovable. In that case it retains
+ownership and quarantines encrypted startup for the rest of the process rather
+than pretending the crypto backend can restart safely.
+
+Filesystem cleanup after a proven client stop is retryable. Completed marker,
+lock, and process-release phases are remembered so a retry does not stop the
+client twice or touch a successor's lock. A concurrent `start()` is rejected
+until that cleanup finishes.
+
+## Persistence barriers
+
+The SDK's browser-oriented crypto store runs in one `fake-indexeddb` instance.
+Snapshots serialize its binary values without JSON conversion and are intended
+to be restored by the same JavaScript runtime family that created them.
+
+Timer, explicit-barrier, and shutdown snapshots share one serialized queue.
+Periodic checkpoints reduce the amount of state exposed to a process crash,
+but do not by themselves provide crash consistency. The adapter also places
+correctness barriers at the points where local crypto advancement could
+otherwise outrun durable state:
+
+- after Rust-crypto initialization and before sync starts;
+- before encrypted Matrix writes reach the network;
+- before sending the next incremental `/sync` token, after processing the
+  preceding response;
+- before delivering a newly decrypted message into Letta; and
+- during clean shutdown.
+
+The two crypto databases cannot be snapshotted in one IndexedDB transaction.
+The implementation therefore reads each database consistently, validates both,
+and atomically replaces the snapshot file. It hard-links the old current
+snapshot to a temporary previous-generation candidate before replacing current,
+so publication never removes the authoritative path.
+
+Byte-identical state is validated but does not rotate generations. The state
+directory is still synced before the barrier succeeds. The complete databases
+are compared at every incremental-sync barrier; this favors an auditable
+correctness boundary over an activity heuristic that might acknowledge
+unpersisted key state.
+
+If a decrypted-event checkpoint fails, delivery is retried after the next
+successful incremental-sync barrier. That queue is process-local, not a durable
+host-delivery queue. Teardown drops pending entries with a content-free warning
+so the loss remains observable.
+
+## Encrypted event policy
+
+Only post-decryption `m.room.message` events pass through the existing room,
+sender, mention, message-type, and deduplication gates. Wire-encryption and room
+encryption state must agree. Missing or withheld keys stay on the encrypted
+path and produce bounded diagnostics.
+
+Outbound sends require an allowed room, a running encrypted runtime, current
+sync state, and a room known to be encrypted. Plaintext mode checks the same
+room state and refuses to send when encryption is enabled there.
+
+The adapter records Matrix shield telemetry using the pinned SDK's encryption
+and user-verification APIs. This is diagnostic only; v1 does not silently impose
+a verified-senders-only policy.
 
 ## Device and recovery model
 
-The first encrypted startup creates or restores the bot's Matrix device. A
-first bootstrap is allowed only when the runtime itself creates the state
-directory; a pre-existing empty directory is treated as suspicious. The
-adapter records the homeserver, channel account ID, bot user ID, and device ID
-beside its crypto state and verifies that they match before restore. The
-default directory is durable `channel/state/<account>`, and configured relative
-paths are resolved from `channel/`, not the listener's process directory.
+The host-local snapshot preserves the current device's Olm and Megolm state.
+Server-side room-key backup preserves eligible historical Megolm sessions for a
+replacement device. Neither mechanism substitutes for the other:
 
-Cross-signing, secret storage, and room-key backup are managed through an
-explicit offline control command. Normal startup only checks and enables an
-existing usable backup; it never creates, replaces, or resets recovery state.
-Initial setup exports the secret-storage recovery key before server mutation,
-bootstraps cross-signing, and creates a backup only when none exists. Existing
-cross-signing or backup state must be recoverable before setup continues.
+- backup cannot recreate the old Matrix device or its Olm state; and
+- a previous local snapshot cannot safely roll back the current device.
 
-The local recovery-key copy is identity-bound and mode `0600`; an operator must
-also retain the exported key outside the disposable crypto-state directory and
-preferably off-machine. A supplied recovery key remains an in-memory candidate
-until it is validated against server secret storage, so a wrong file cannot
-poison durable local state. Replacement-device restore imports the full room-key
-backup without changing its version, recovers the published cross-signing
-identity, verifies the recovered master-key ID has not changed, and signs the
-new device. Partial key imports fail the control operation. Backup reset is
-intentionally absent.
+Cross-signing, secret storage, and room-key backup are managed by an explicit
+offline command while the listener is stopped. Normal startup checks and
+enables an existing usable backup, but never creates, replaces, or resets one.
+Setup exports the secret-storage recovery key before mutating server recovery
+state. It refuses to replace cross-signing or backup state it cannot recover.
 
-Room-key backup complements the host-local IndexedDB snapshot; it does not make
-snapshot rollback safe and cannot recreate the old Matrix device or its Olm
-state. If state is missing or identity metadata does not match, the adapter
-fails with a specific recovery error. It must not silently create a new device
-over an existing state directory.
+The exported recovery key is identity-bound, stored outside the crypto-state
+directory, and mode `0600`. A supplied key remains an in-memory candidate until
+the server validates it, so a wrong file cannot poison durable local state.
 
-## Port phases
+Replacement-device restore requires a new Matrix device ID and an unused state
+directory. It imports the complete room-key backup without changing the backup
+version, recovers the published cross-signing identity, verifies that the
+master-key ID is unchanged, and signs the replacement device. Partial key
+imports fail. Backup reset is intentionally absent.
 
-### Phase 1 — persistence primitives
+An unclean exit leaves the active marker in place and blocks startup. Offline
+recovery requires the operator to inspect the current snapshot, acknowledge the
+exact marker token and account/device identity, prove the marker PID is dead,
+and acquire the state lock. The command then revalidates all inputs under that
+lock and atomically retains the marker as recovery evidence. It never selects
+the previous snapshot.
 
-`channel/crypto/idb-state.mjs` is the first adapted module. It provides binary
-snapshot/restore and account-state locking. It is independently tested and
-used by the phase-2 runtime, but does not by itself mean E2EE is supported.
+If the current snapshot is missing or corrupt, the old device cannot be safely
+recovered from local state. Revoke it in a trusted Matrix client, obtain a token
+for a new device ID, use an unused state directory, and restore the room-key
+backup if one was configured before the loss.
 
-### Phase 2 — crypto runtime and adapter lifecycle
+## Validation
 
-Install the fake IndexedDB runtime, enforce single encrypted-account ownership,
-restore state, initialize Rust crypto before sync, and snapshot at startup,
-periodically, on clean stop, and at exposed sync/key-processing barriers.
+Fast tests cover configuration, lifecycle cancellation and restart, identity
+binding, timer cleanup, checkpoint serialization, lock takeover, recovery
+controls, SDK compatibility, and plaintext refusal.
 
-These checkpoints reduce the amount of state exposed to a process crash.
-Fake-IndexedDB snapshots cannot transact across both crypto databases, so
-encrypted network writes pass a serialized snapshot barrier after the SDK
-advances crypto state and before the request reaches the network.
-Before each incremental `/sync` request, the adapter also snapshots crypto
-state processed from the preceding response. If that snapshot fails, it does
-not send the next `since` token or acknowledge those to-device updates.
-Byte-identical state is read and validated but skips snapshot republication and
-generation rotation; it still syncs the state directory to confirm any prior
-rename before the barrier succeeds.
-This v1 barrier deliberately dumps and compares the complete crypto databases
-before every incremental sync. That correctness-first cost should be measured
-with production-sized stores before any future dirty-state optimization; an
-incomplete activity heuristic could acknowledge unpersisted key state.
-Previous-generation rollback remains forbidden.
+The Docker-backed `npm run test:e2ee` gate uses an isolated Synapse and a
+separate Matrix peer to prove:
 
-If a decrypted-event checkpoint fails, the adapter retries that delivery after
-the next successful incremental-sync barrier. This retry queue is process-local,
-not a durable host-delivery queue; lifecycle teardown drops queued entries with
-a content-free warning so the loss is observable.
+- encrypted inbound and outbound wire events and peer decryption;
+- same-device clean restart and device-key continuity;
+- explicit recovery after crashes around encrypted writes and acknowledged
+  incremental sync;
+- peer decryption of both held and post-recovery ciphertext, guarding against
+  outbound Megolm-index reuse;
+- corrupt-current fail-closed behavior and replacement-device bootstrap;
+- cross-process state ownership;
+- no plaintext room-send request before or after sync;
+- room-key backup creation and upload of new session material;
+- rejection of a valid but wrong recovery key without durable poisoning; and
+- full historical decryption on a fresh device after backup restore.
 
-Clean shutdown advances through a final snapshot, owned active-marker removal,
-filesystem-lock release, and process-guard release. Each destructive step
-records its completed phase, so a transient filesystem failure can be retried
-without repeating Matrix client shutdown or touching a successor's lock. Until
-the retry completes, startup stays blocked and ownership remains held.
-Ownership loss, malformed metadata, and dead transition gates are not
-advertised as retryable: they permanently quarantine encrypted startup in that
-process and require operator recovery.
-
-The runtime-active marker makes an unclean process exit fail closed on the next
-startup. Recovery is an explicit offline operation: inspect the state, confirm
-the exact marker token plus homeserver/account/user/device identity, acquire
-and safely reclaim the dead owner's state lock, revalidate the secure marker,
-identity, and current snapshot under that lock, verify the marker PID is dead,
-then atomically move the marker to retained recovery evidence. Startup never
-auto-clears the marker, and recovery never selects the previous snapshot.
-
-If Rust initialization rejects, the mandatory first snapshot fails, an
-IndexedDB delete is blocked, or Matrix client shutdown cannot be proven, the
-interval timer is stopped but the marker, filesystem lock, and process guard
-remain quarantined until process exit.
-
-Phase 3 and the real-room gate are now implemented. Encrypted delivery and
-sending are enabled only after guarded crypto startup; plaintext mode continues
-to drop encrypted timeline events and refuse sends to encrypted rooms.
-
-### Phase 3 — decryption and trust policy
-
-Deliver only post-decryption `m.room.message` events through existing room,
-sender, mention, and dedupe gates. Handle withheld/missing keys explicitly.
-Record strict shield telemetry, derived from the pinned SDK's public encryption
-and user-verification APIs, without silently imposing a verified-only policy.
-
-### Phase 4 — real integration tests
-
-No release advertises E2EE until a real homeserver test proves encrypted inbound
-and outbound delivery, same-device restart, crash recovery, state corruption
-recovery, single-owner enforcement, and no plaintext send before sync.
-
-The Docker-backed `npm run test:e2ee` gate now proves real encrypted inbound and
-outbound wire events, peer decryption, same-device clean restart, device-key
-continuity, explicit recovery after SIGKILL both before the room fetch and
-after Synapse accepts the event, and recovery after Synapse accepts an
-incremental sync following fresh inbound session state. The pre-network crash
-case publishes both the held ciphertext and a newly encrypted post-recovery
-event; the real peer decrypts both, guarding against outbound Megolm-index
-reuse. The gate also covers corrupt-current fail-closed behavior, new-device
-bootstrap on an unused state directory with old-device revocation,
-cross-process state-lock enforcement, and no plaintext room-send request before
-or after sync. It now also creates a real server room-key backup, confirms that
-new inbound session material is uploaded, rejects a valid but wrong recovery
-key without poisoning local state, restores the unchanged backup onto a fresh
-device, and decrypts a historical ciphertext using the restored session.
-
-A missing or corrupt current snapshot is not recoverable as the same device.
-The operator must revoke that device through a trusted Matrix client, obtain a
-token bound to a new device ID, and bootstrap an unused state directory. When a
-validated room-key backup exists, the replacement device can then restore its
-backed-up historical Megolm sessions from the external recovery-key export.
+These tests establish the current integration boundary. They do not make
+snapshot rollback safe, turn the local delivery retry queue into durable
+delivery, or establish a verified-senders-only trust policy.

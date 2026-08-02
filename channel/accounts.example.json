@@ -5,18 +5,20 @@
       "accountId": "main",
       "displayName": "Matrix",
       "enabled": true,
+      "agentId": "agent-local-REPLACE_WITH_AGENT_ID",
       "dmPolicy": "allowlist",
       "groupPolicy": "allowlist",
-      "allowedUsers": ["@sky:example.org"],
+      "allowedUsers": ["@you:example.org"],
       "config": {
         "homeserverUrl": "https://matrix.example.org",
         "bot_token": "PASTE_DEDICATED_BOT_ACCESS_TOKEN_HERE",
         "allowedRooms": ["!replace-with-room-id:example.org"],
-        "allowedUsers": ["@sky:example.org"],
+        "allowedUsers": ["@you:example.org"],
         "requireMention": true,
         "mentionAliases": ["matrix"],
         "encryption": {
-          "enabled": false
+          "enabled": false,
+          "stateDir": "state/main"
         }
       },
       "createdAt": "2026-07-27T00:00:00.000Z",
