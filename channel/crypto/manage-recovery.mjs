@@ -13,6 +13,7 @@ import {
 import { channelPlugin } from "../plugin.mjs";
 
 const DEFAULT_ACCOUNTS_FILE = resolve(homedir(), ".letta/channels/matrix/accounts.json");
+const INITIAL_SYNC_TIMEOUT_MS = 60_000;
 
 function usage() {
   return [
@@ -216,6 +217,7 @@ export async function main({
   let operationError;
   try {
     await adapter.start();
+    await adapter.waitForInitialSync({ timeoutMs: INITIAL_SYNC_TIMEOUT_MS });
     if (options.command === "status") {
       result = await adapter.getEncryptionRecoveryStatus();
     } else if (options.command === "setup") {
@@ -268,14 +270,31 @@ export async function main({
   }
 }
 
+export async function flushOutputAndExit(
+  exitCode,
+  {
+    stdout = process.stdout,
+    stderr = process.stderr,
+    exit = process.exit,
+  } = {},
+) {
+  await Promise.all([
+    new Promise((resolveWrite) => stdout.write("", resolveWrite)),
+    new Promise((resolveWrite) => stderr.write("", resolveWrite)),
+  ]);
+  exit(exitCode);
+}
+
 if (
   process.argv[1]
   && import.meta.url === pathToFileURL(resolve(process.argv[1])).href
 ) {
+  let exitCode = 0;
   try {
     await main();
   } catch (error) {
     console.error(formatError(error));
-    process.exitCode = 1;
+    exitCode = 1;
   }
+  await flushOutputAndExit(exitCode);
 }

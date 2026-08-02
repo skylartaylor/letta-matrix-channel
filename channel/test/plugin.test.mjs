@@ -172,7 +172,7 @@ async function waitUntil(predicate, label) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
-const { channelPlugin } = await import("../plugin.mjs");
+const { channelPlugin, installMatrixSyncLoopTracking } = await import("../plugin.mjs");
 
 function makeAdapter({ config = {}, client: clientOverrides = {} } = {}) {
   const client = makeClient(clientOverrides);
@@ -262,6 +262,22 @@ async function test(name, fn) {
 }
 
 try {
+  await test("sync-loop tracking retains a settled loop for shutdown", async () => {
+    class TestSyncApi {
+      sync() {
+        return Promise.resolve("settled");
+      }
+    }
+    installMatrixSyncLoopTracking(TestSyncApi);
+    const syncApi = new TestSyncApi();
+    const loop = syncApi.sync();
+    await loop;
+    assert.equal(
+      syncApi[Symbol.for("letta.matrix.syncLoopPromise")],
+      loop,
+    );
+  });
+
   await test("whoami resolves identity before startClient", async () => {
     const { adapter, client } = await startedAdapter();
     assert.equal(adapter.selfUserId, SELF);
@@ -451,6 +467,511 @@ try {
       releaseOperation?.();
       if (!stopped) await made.adapter.stop();
     }
+  });
+
+  await test("recovery readiness waits for the initial sync boundary", async () => {
+    const stateDir = makeCryptoStateDir("initial-sync-ready");
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await made.adapter.start();
+      let ready = false;
+      const waiting = made.adapter.waitForInitialSync({ timeoutMs: 1_000 }).then(() => {
+        ready = true;
+      });
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      assert.equal(ready, false);
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      await waiting;
+      assert.equal(ready, true);
+    } finally {
+      await made.adapter.stop();
+    }
+  });
+
+  await test("recovery readiness rejects a timeout and a stopped lifecycle", async () => {
+    const timeoutClient = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const timeoutAdapter = makeFactoryAdapter({
+      clients: [timeoutClient],
+      config: { encryption: { enabled: true, stateDir: makeCryptoStateDir("initial-sync-timeout") } },
+    }).adapter;
+    await timeoutAdapter.start();
+    await assert.rejects(
+      () => timeoutAdapter.waitForInitialSync({ timeoutMs: 20 }),
+      /Matrix initial sync timed out after 20ms/,
+    );
+    await timeoutAdapter.stop();
+
+    const stoppedClient = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const stoppedAdapter = makeFactoryAdapter({
+      clients: [stoppedClient],
+      config: { encryption: { enabled: true, stateDir: makeCryptoStateDir("initial-sync-stopped") } },
+    }).adapter;
+    await stoppedAdapter.start();
+    const waiting = stoppedAdapter.waitForInitialSync({ timeoutMs: 1_000 });
+    const rejected = assert.rejects(
+      () => waiting,
+      /Matrix adapter changed while waiting for initial sync/,
+    );
+    await stoppedAdapter.stop();
+    await rejected;
+  });
+
+  await test("encrypted stop drains all pinned SDK crypto workers before closing Rust", async () => {
+    const order = [];
+    let syncState = "SYNCING";
+    let releaseBackup;
+    const backupGate = new Promise((resolveBackup) => { releaseBackup = resolveBackup; });
+    let releaseBackupCheck;
+    const backupCheckGate = new Promise((resolveCheck) => { releaseBackupCheck = resolveCheck; });
+    let releaseBackupDownload;
+    const backupDownloadGate = new Promise((resolveDownload) => {
+      releaseBackupDownload = resolveDownload;
+    });
+    let releaseBackupDownloadCheck;
+    const backupDownloadCheckGate = new Promise((resolveCheck) => {
+      releaseBackupDownloadCheck = resolveCheck;
+    });
+    let releaseKeyClaim;
+    const keyClaimGate = new Promise((resolveKeyClaim) => { releaseKeyClaim = resolveKeyClaim; });
+    let releaseOutgoing;
+    const outgoingGate = new Promise((resolveOutgoing) => { releaseOutgoing = resolveOutgoing; });
+    const crypto = {
+      backupManager: {
+        stopped: false,
+        backupKeysLoopRunning: true,
+        keyBackupCheckInProgress: null,
+        stop() {
+          this.stopped = true;
+          order.push("backup-stop");
+          void backupGate.then(() => {
+            const pending = backupCheckGate.finally(() => {
+              if (this.keyBackupCheckInProgress === pending) {
+                this.keyBackupCheckInProgress = null;
+              }
+            });
+            this.keyBackupCheckInProgress = pending;
+            this.backupKeysLoopRunning = false;
+          });
+        },
+      },
+      perSessionBackupDownloader: {
+        stopped: false,
+        downloadLoopRunning: true,
+        currentBackupVersionCheck: null,
+        stop() {
+          this.stopped = true;
+          order.push("backup-download-stop");
+          void backupDownloadGate.then(() => {
+            const pending = backupDownloadCheckGate.finally(() => {
+              if (this.currentBackupVersionCheck === pending) {
+                this.currentBackupVersionCheck = null;
+              }
+            });
+            this.currentBackupVersionCheck = pending;
+            this.downloadLoopRunning = false;
+          });
+        },
+      },
+      keyClaimManager: {
+        stopped: false,
+        currentClaimPromise: keyClaimGate,
+        stop() {
+          this.stopped = true;
+          order.push("key-claim-stop");
+        },
+      },
+      outgoingRequestsManager: {
+        stopped: false,
+        outgoingRequestLoopRunning: true,
+        stop() {
+          this.stopped = true;
+          order.push("outgoing-stop");
+          void outgoingGate.then(() => {
+            this.outgoingRequestLoopRunning = false;
+          });
+        },
+      },
+    };
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      getCrypto: () => crypto,
+      http: { abort: () => { order.push("http-abort"); } },
+      stopClient: async () => { order.push("stopClient"); },
+    });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir: makeCryptoStateDir("sync-stop-drain") } },
+    });
+    await made.adapter.start();
+    client.syncApi = {
+      running: true,
+      getSyncState: () => syncState,
+      stop() {
+        this.running = false;
+        order.push("sync-stop");
+      },
+      retryImmediately() { order.push("sync-retry"); },
+    };
+    const stopping = made.adapter.stop();
+    await waitUntil(() => order.includes("sync-stop"), "sync drain start");
+    assert.deepEqual(order, ["sync-stop", "sync-retry", "http-abort"]);
+    assert.equal(order.includes("stopClient"), false);
+    syncState = "STOPPED";
+    for (const handler of [...(client.handlers.get("sync") ?? [])]) handler("STOPPED");
+    await waitUntil(() => order.includes("backup-stop"), "backup crypto drain start");
+    assert.equal(order.includes("backup-download-stop"), true);
+    assert.equal(order.includes("key-claim-stop"), true);
+    assert.equal(order.includes("outgoing-stop"), true);
+    assert.equal(order.includes("http-abort"), true);
+    assert.equal(order.includes("stopClient"), false);
+    releaseBackup();
+    releaseBackupDownload();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(order.includes("stopClient"), false);
+    releaseBackupCheck();
+    releaseBackupDownloadCheck();
+    releaseKeyClaim();
+    releaseOutgoing();
+    await stopping;
+    assert.deepEqual(order, [
+      "sync-stop",
+      "sync-retry",
+      "http-abort",
+      "backup-stop",
+      "backup-download-stop",
+      "key-claim-stop",
+      "outgoing-stop",
+      "http-abort",
+      "stopClient",
+    ]);
+  });
+
+  await test("encrypted stop quarantines without closing Rust after a backup-drain timeout", async () => {
+    const firstClient = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      getCrypto: () => ({
+        backupManager: {
+          stopped: false,
+          backupKeysLoopRunning: true,
+          keyBackupCheckInProgress: null,
+          stop() { this.stopped = true; },
+        },
+      }),
+      http: { abort() {} },
+    });
+    const made = makeFactoryAdapter({
+      clients: [firstClient],
+      accountId: "backup-drain-timeout",
+      config: {
+        encryption: {
+          enabled: true,
+          stateDir: makeCryptoStateDir("backup-drain-timeout"),
+        },
+      },
+    });
+    await made.adapter.start();
+    const runtime = made.adapter.cryptoRuntime;
+    const realRuntimeStop = runtime.stop.bind(runtime);
+    let quarantineCalls = 0;
+    runtime.quarantine = async () => {
+      quarantineCalls += 1;
+      await realRuntimeStop();
+    };
+    const realDrain = made.adapter.drainClientCryptoWork.bind(made.adapter);
+    made.adapter.drainClientCryptoWork = (drainClient) => realDrain(
+      drainClient,
+      { timeoutMs: 20 },
+    );
+
+    await assert.rejects(
+      () => made.adapter.stop(),
+      /Matrix crypto backup shutdown timed out after 20ms/,
+    );
+    assert.equal(firstClient.calls.filter((call) => call === "stopClient").length, 0);
+    assert.equal(quarantineCalls, 1);
+    assert.equal(made.adapter.isRunning(), false);
+  });
+
+  await test("encrypted stop drains a pre-PREPARED initial sync before closing Rust", async () => {
+    const order = [];
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      stopClient: async () => {
+        client.clientRunning = false;
+        order.push("stopClient");
+      },
+    });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      config: {
+        encryption: {
+          enabled: true,
+          stateDir: makeCryptoStateDir("initial-sync-stop-drain"),
+        },
+      },
+    });
+    await made.adapter.start();
+    client.clientRunning = true;
+    client.syncApi = {
+      running: true,
+      catchingUp: true,
+      currentSyncRequest: Promise.resolve(),
+      getSyncState: () => null,
+      stop() {
+        this.running = false;
+        order.push("sync-stop");
+      },
+      retryImmediately() {},
+    };
+    const stopping = made.adapter.stop();
+    await waitUntil(() => order.includes("sync-stop"), "initial sync drain start");
+    assert.equal(order.includes("stopClient"), false);
+    for (const handler of [...(client.handlers.get("sync") ?? [])]) handler("STOPPED");
+    await stopping;
+    assert.deepEqual(order, ["sync-stop", "stopClient"]);
+  });
+
+  await test("encrypted stop quarantines without closing Rust after a sync-drain timeout", async () => {
+    const firstClient = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [firstClient],
+      accountId: "sync-drain-timeout",
+      config: {
+        encryption: {
+          enabled: true,
+          stateDir: makeCryptoStateDir("sync-drain-timeout"),
+        },
+      },
+    });
+    await made.adapter.start();
+    firstClient.syncApi = {
+      running: true,
+      getSyncState: () => "SYNCING",
+      stop() { this.running = false; },
+      retryImmediately() {},
+    };
+    const runtime = made.adapter.cryptoRuntime;
+    const realRuntimeStop = runtime.stop.bind(runtime);
+    let quarantineCalls = 0;
+    runtime.quarantine = async () => {
+      quarantineCalls += 1;
+      await realRuntimeStop();
+    };
+    const realDrain = made.adapter.drainClientCryptoWork.bind(made.adapter);
+    made.adapter.drainClientCryptoWork = (drainClient) => realDrain(
+      drainClient,
+      { timeoutMs: 20 },
+    );
+
+    await assert.rejects(
+      () => made.adapter.stop(),
+      /Matrix sync drain timed out after 20ms/,
+    );
+    assert.equal(firstClient.calls.filter((call) => call === "stopClient").length, 0);
+    assert.equal(quarantineCalls, 1);
+    assert.equal(made.adapter.isRunning(), false);
+    await assert.rejects(
+      () => made.adapter.start(),
+      /cannot restart after failed lifecycle cleanup/,
+    );
+  });
+
+  await test("encrypted stop quarantines without closing Rust after an outgoing-drain timeout", async () => {
+    const firstClient = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      getCrypto: () => ({
+        outgoingRequestsManager: {
+          stopped: true,
+          outgoingRequestLoopRunning: true,
+          stop() { this.stopped = true; },
+        },
+      }),
+      http: { abort() {} },
+    });
+    const made = makeFactoryAdapter({
+      clients: [firstClient],
+      accountId: "outgoing-drain-timeout",
+      config: {
+        encryption: {
+          enabled: true,
+          stateDir: makeCryptoStateDir("outgoing-drain-timeout"),
+        },
+      },
+    });
+    await made.adapter.start();
+    const runtime = made.adapter.cryptoRuntime;
+    const realRuntimeStop = runtime.stop.bind(runtime);
+    let quarantineCalls = 0;
+    runtime.quarantine = async () => {
+      quarantineCalls += 1;
+      await realRuntimeStop();
+    };
+    const realDrain = made.adapter.drainClientCryptoWork.bind(made.adapter);
+    made.adapter.drainClientCryptoWork = (drainClient) => realDrain(
+      drainClient,
+      { timeoutMs: 20 },
+    );
+
+    await assert.rejects(
+      () => made.adapter.stop(),
+      /Matrix crypto outgoing-request shutdown timed out after 20ms/,
+    );
+    assert.equal(firstClient.calls.filter((call) => call === "stopClient").length, 0);
+    assert.equal(quarantineCalls, 1);
+    assert.equal(made.adapter.isRunning(), false);
+  });
+
+  await test("encrypted stop drains live sync loops in recovery states", async () => {
+    for (const state of ["ERROR", "RECONNECTING"]) {
+      const firstClient = makeEncryptedClient({ initRustCrypto: async () => {} });
+      const secondClient = makeEncryptedClient({ initRustCrypto: async () => {} });
+      const made = makeFactoryAdapter({
+        clients: [firstClient, secondClient],
+        accountId: `inactive-sync-${state.toLowerCase()}`,
+        config: {
+          encryption: {
+            enabled: true,
+            stateDir: makeCryptoStateDir(`inactive-sync-${state.toLowerCase()}`),
+          },
+        },
+      });
+      await made.adapter.start();
+      let syncStopCalls = 0;
+      firstClient.syncApi = {
+        running: true,
+        getSyncState: () => state,
+        stop() {
+          this.running = false;
+          syncStopCalls += 1;
+        },
+        retryImmediately() {},
+      };
+      const realDrain = made.adapter.drainClientCryptoWork.bind(made.adapter);
+      made.adapter.drainClientCryptoWork = (drainClient) => realDrain(
+        drainClient,
+        { timeoutMs: 20 },
+      );
+      const stopping = made.adapter.stop();
+      await waitUntil(() => syncStopCalls === 1, `${state} sync drain start`);
+      assert.equal(firstClient.calls.includes("stopClient"), false);
+      for (const handler of [...(firstClient.handlers.get("sync") ?? [])]) handler("STOPPED");
+      await stopping;
+      assert.equal(syncStopCalls, 1, state);
+      assert.equal(firstClient.calls.filter((call) => call === "stopClient").length, 1);
+      try {
+        await made.adapter.start();
+        assert.equal(made.getCreateCount(), 2);
+      } finally {
+        await made.adapter.stop();
+      }
+    }
+  });
+
+  await test("encrypted stop accepts a tracked sync loop settling without STOPPED", async () => {
+    let settleLoop;
+    const loop = new Promise((resolveLoop) => { settleLoop = resolveLoop; });
+    const firstClient = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [firstClient],
+      accountId: "settled-sync-loop",
+      config: {
+        encryption: {
+          enabled: true,
+          stateDir: makeCryptoStateDir("settled-sync-loop"),
+        },
+      },
+    });
+    await made.adapter.start();
+    firstClient.syncApi = {
+      running: true,
+      getSyncState: () => "ERROR",
+      stop() { this.running = false; },
+      retryImmediately() { settleLoop(); },
+      [Symbol.for("letta.matrix.syncLoopPromise")]: loop,
+    };
+    await made.adapter.stop();
+    assert.equal(firstClient.calls.filter((call) => call === "stopClient").length, 1);
+  });
+
+  await test("encrypted stop skips a sync loop that is already not running", async () => {
+    const firstClient = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [firstClient],
+      accountId: "inactive-sync-loop",
+      config: {
+        encryption: {
+          enabled: true,
+          stateDir: makeCryptoStateDir("inactive-sync-loop"),
+        },
+      },
+    });
+    await made.adapter.start();
+    let syncStopCalls = 0;
+    firstClient.syncApi = {
+      running: false,
+      getSyncState: () => "ERROR",
+      stop() { syncStopCalls += 1; },
+      retryImmediately() {},
+    };
+    await made.adapter.stop();
+    assert.equal(syncStopCalls, 0);
+    assert.equal(firstClient.calls.filter((call) => call === "stopClient").length, 1);
+  });
+
+  await test("cancelled startup quarantines without closing Rust after an unsafe drain failure", async () => {
+    let enteredStartClient;
+    let releaseStartClient;
+    const startClientEntered = new Promise((resolveEntered) => {
+      enteredStartClient = resolveEntered;
+    });
+    const startClientGate = new Promise((resolveStartClient) => {
+      releaseStartClient = resolveStartClient;
+    });
+    const firstClient = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      startClient: async () => {
+        firstClient.calls.push("startClient");
+        enteredStartClient();
+        await startClientGate;
+      },
+    });
+    const made = makeFactoryAdapter({
+      clients: [firstClient],
+      accountId: "startup-drain-failure",
+      config: {
+        encryption: {
+          enabled: true,
+          stateDir: makeCryptoStateDir("startup-drain-failure"),
+        },
+      },
+    });
+    const starting = made.adapter.start();
+    await startClientEntered;
+    const runtime = made.adapter.cryptoRuntime;
+    const realRuntimeStop = runtime.stop.bind(runtime);
+    let quarantineCalls = 0;
+    runtime.quarantine = async () => {
+      quarantineCalls += 1;
+      await realRuntimeStop();
+    };
+    made.adapter.drainClientCryptoWork = async () => {
+      throw new Error("startup crypto drain failed");
+    };
+    const stopping = made.adapter.stop();
+    releaseStartClient();
+    const results = await Promise.allSettled([starting, stopping]);
+    assert.equal(results.every(({ status }) => status === "rejected"), true);
+    assert.match(String(results[0].reason), /Matrix cancelled startup cleanup failed/);
+    assert.equal(firstClient.calls.filter((call) => call === "stopClient").length, 0);
+    assert.equal(quarantineCalls, 1);
+    await assert.rejects(
+      () => made.adapter.start(),
+      /cannot restart after failed lifecycle cleanup/,
+    );
   });
 
   await test("encrypted incremental sync checkpoints before acknowledging crypto state", async () => {
@@ -2333,6 +2854,154 @@ try {
       ]]);
     } finally {
       await adapter.stop();
+    }
+  });
+
+  await test("encrypted stop waits for an in-flight room encryption", async () => {
+    const stateDir = makeCryptoStateDir("encrypted-send-stop-drain");
+    let enterSend;
+    let releaseSend;
+    let sendSettled = false;
+    let abortBeforeSendSettled = false;
+    const sendEntered = new Promise((resolveEntered) => { enterSend = resolveEntered; });
+    const sendGate = new Promise((resolveSend) => { releaseSend = resolveSend; });
+    const crypto = {
+      backupManager: {
+        stopped: false,
+        backupKeysLoopRunning: false,
+        keyBackupCheckInProgress: null,
+        stop() { this.stopped = true; },
+      },
+      perSessionBackupDownloader: {
+        stopped: false,
+        downloadLoopRunning: false,
+        currentBackupVersionCheck: null,
+        stop() { this.stopped = true; },
+      },
+      keyClaimManager: {
+        stopped: false,
+        currentClaimPromise: Promise.resolve(),
+        stop() { this.stopped = true; },
+      },
+      outgoingRequestsManager: {
+        stopped: false,
+        outgoingRequestLoopRunning: false,
+        stop() { this.stopped = true; },
+      },
+    };
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      getCrypto: () => crypto,
+      http: {
+        abort() {
+          if (!sendSettled) abortBeforeSendSettled = true;
+        },
+      },
+      getRoom: () => ({
+        hasEncryptionStateEvent: () => true,
+        currentState: { getStateEvents: () => ({ type: "m.room.encryption" }) },
+      }),
+      sendEvent: async () => {
+        enterSend();
+        await sendGate;
+        sendSettled = true;
+        return { event_id: "$drained" };
+      },
+    });
+    const { adapter } = makeFactoryAdapter({
+      clients: [client],
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      const sending = adapter.sendMessage({ chatId: ROOM, text: "matrix wait for encryption" });
+      await sendEntered;
+      client.syncApi = {
+        running: true,
+        getSyncState: () => "SYNCING",
+        stop() { this.running = false; },
+        retryImmediately() {},
+        [Symbol.for("letta.matrix.syncLoopPromise")]: Promise.resolve(),
+      };
+      const stopping = adapter.stop();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(client.calls.includes("stopClient"), false);
+      assert.equal(abortBeforeSendSettled, false);
+      releaseSend();
+      assert.equal((await sending).messageId, "$drained");
+      await stopping;
+      assert.equal(abortBeforeSendSettled, false);
+      assert.equal(client.calls.filter((call) => call === "stopClient").length, 1);
+    } finally {
+      releaseSend?.();
+      await adapter.stop();
+    }
+  });
+
+  await test("encrypted room-send timeout quarantines without closing Rust", async () => {
+    const stateDir = makeCryptoStateDir("encrypted-send-stop-timeout");
+    let enterSend;
+    let releaseSend;
+    let sending;
+    const sendEntered = new Promise((resolveEntered) => { enterSend = resolveEntered; });
+    const sendGate = new Promise((resolveSend) => { releaseSend = resolveSend; });
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      getCrypto: () => ({
+        outgoingRequestsManager: {
+          stopped: false,
+          outgoingRequestLoopRunning: false,
+          stop() { this.stopped = true; },
+        },
+      }),
+      http: { abort() {} },
+      getRoom: () => ({
+        hasEncryptionStateEvent: () => true,
+        currentState: { getStateEvents: () => ({ type: "m.room.encryption" }) },
+      }),
+      sendEvent: async () => {
+        enterSend();
+        await sendGate;
+        return { event_id: "$late" };
+      },
+    });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      accountId: "encrypted-send-stop-timeout",
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      await made.adapter.start();
+      for (const handler of client.handlers.get("sync") ?? []) handler("PREPARED");
+      sending = made.adapter.sendMessage({ chatId: ROOM, text: "matrix send timeout" });
+      await sendEntered;
+      const runtime = made.adapter.cryptoRuntime;
+      const realRuntimeStop = runtime.stop.bind(runtime);
+      let quarantineCalls = 0;
+      runtime.quarantine = async () => {
+        quarantineCalls += 1;
+        await realRuntimeStop();
+      };
+      const realDrain = made.adapter.drainClientCryptoWork.bind(made.adapter);
+      made.adapter.drainClientCryptoWork = (drainClient) => realDrain(
+        drainClient,
+        { timeoutMs: 20 },
+      );
+
+      await assert.rejects(
+        () => made.adapter.stop(),
+        /Matrix encrypted room-send shutdown timed out after 20ms/,
+      );
+      assert.equal(client.calls.filter((call) => call === "stopClient").length, 0);
+      assert.equal(quarantineCalls, 1);
+      await assert.rejects(
+        () => made.adapter.start(),
+        /cannot restart after failed lifecycle cleanup/,
+      );
+    } finally {
+      releaseSend?.();
+      await sending?.catch(() => {});
     }
   });
 

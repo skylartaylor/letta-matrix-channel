@@ -16,6 +16,9 @@ const DECRYPTED_EVENT_NAME = "Event.decrypted";
 const WHOAMI_RETRY_DELAYS_MS = [500, 1500];
 const WHOAMI_TIMEOUT_MS = 10_000;
 const CRYPTO_CONTROL_TIMEOUT_MS = 5 * 60_000;
+const CRYPTO_STOP_DRAIN_TIMEOUT_MS = 15_000;
+const MATRIX_SYNC_LOOP_PROMISE = Symbol.for("letta.matrix.syncLoopPromise");
+const MATRIX_SYNC_LOOP_PATCHED = Symbol.for("letta.matrix.syncLoopPatched");
 const TYPING_TIMEOUT_MS = 30_000;
 const TYPING_REFRESH_MS = 10_000;
 const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
@@ -157,10 +160,31 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export function installMatrixSyncLoopTracking(SyncApi) {
+  const prototype = SyncApi?.prototype;
+  const originalSync = prototype?.sync;
+  if (typeof originalSync !== "function") {
+    throw new Error("Matrix sync-loop tracking is unavailable in the pinned SDK runtime");
+  }
+  if (originalSync[MATRIX_SYNC_LOOP_PATCHED] === true) return;
+  const trackedSync = function (...args) {
+    const loop = originalSync.apply(this, args);
+    this[MATRIX_SYNC_LOOP_PROMISE] = loop;
+    // Retain a settled loop so shutdown can distinguish it from an untracked
+    // loop that still requires the SDK's STOPPED event.
+    void Promise.resolve(loop).catch(() => {});
+    return loop;
+  };
+  Object.defineProperty(trackedSync, MATRIX_SYNC_LOOP_PATCHED, { value: true });
+  prototype.sync = trackedSync;
+}
+
 function loadSdk() {
   // Custom-channel packages are installed under runtime/, not this project.
   const require = createRequire(new URL("./runtime/package.json", import.meta.url));
-  return require("matrix-js-sdk");
+  const sdk = require("matrix-js-sdk");
+  installMatrixSyncLoopTracking(require("matrix-js-sdk/lib/sync.js").SyncApi);
+  return sdk;
 }
 
 function loadRecoveryKeyDecoder() {
@@ -298,6 +322,247 @@ function withTimeout(promise, ms, label) {
       timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
     }),
   ]).finally(() => clearTimeout(timer));
+}
+
+function cryptoDrainFailure(error, { unsafe }) {
+  const failure = new Error(
+    error instanceof Error ? error.message : String(error),
+    { cause: error },
+  );
+  failure.matrixCryptoClientStopUnsafe = unsafe;
+  return failure;
+}
+
+async function waitForCryptoDrainPromise(promise, {
+  deadline,
+  timeoutMs,
+  label,
+}) {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) throw new Error(`${label} timed out after ${timeoutMs}ms`);
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve(promise).then(() => undefined, () => undefined),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+          remainingMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function waitForCryptoDrainFlag(target, property, {
+  deadline,
+  timeoutMs,
+  label,
+}) {
+  while (target[property]) {
+    if (Date.now() >= deadline) {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }
+    await sleep(Math.min(5, Math.max(1, deadline - Date.now())));
+  }
+}
+
+export async function drainMatrixClientCryptoWork(
+  client,
+  {
+    timeoutMs = CRYPTO_STOP_DRAIN_TIMEOUT_MS,
+    settleClientOperations,
+  } = {},
+) {
+  const syncApi = client?.syncApi;
+  if (client?.clientRunning === true && !syncApi) {
+    throw cryptoDrainFailure(
+      new Error("Matrix sync drain is unavailable in the pinned SDK runtime"),
+      { unsafe: true },
+    );
+  }
+  if (syncApi && (
+    typeof syncApi.getSyncState !== "function"
+    || typeof syncApi.stop !== "function"
+    || typeof syncApi.retryImmediately !== "function"
+    || typeof syncApi.running !== "boolean"
+  )) {
+    throw cryptoDrainFailure(
+      new Error("Matrix sync drain is unavailable in the pinned SDK runtime"),
+      { unsafe: true },
+    );
+  }
+  const crypto = client?.getCrypto?.();
+  const backupManager = crypto?.backupManager;
+  const backupDownloader = crypto?.perSessionBackupDownloader;
+  const keyClaimManager = crypto?.keyClaimManager;
+  const outgoingRequests = crypto?.outgoingRequestsManager;
+  if (backupManager && (
+    typeof backupManager.stopped !== "boolean"
+    || typeof backupManager.backupKeysLoopRunning !== "boolean"
+    || (
+      backupManager.keyBackupCheckInProgress !== null
+      && backupManager.keyBackupCheckInProgress !== undefined
+      && typeof backupManager.keyBackupCheckInProgress?.then !== "function"
+    )
+    || typeof backupManager.stop !== "function"
+  )) {
+    throw cryptoDrainFailure(
+      new Error("Matrix crypto backup drain is unavailable in the pinned SDK runtime"),
+      { unsafe: true },
+    );
+  }
+  if (backupDownloader && (
+    typeof backupDownloader.stopped !== "boolean"
+    || typeof backupDownloader.downloadLoopRunning !== "boolean"
+    || (
+      backupDownloader.currentBackupVersionCheck !== null
+      && backupDownloader.currentBackupVersionCheck !== undefined
+      && typeof backupDownloader.currentBackupVersionCheck?.then !== "function"
+    )
+    || typeof backupDownloader.stop !== "function"
+  )) {
+    throw cryptoDrainFailure(
+      new Error("Matrix crypto backup-download drain is unavailable in the pinned SDK runtime"),
+      { unsafe: true },
+    );
+  }
+  if (keyClaimManager && (
+    typeof keyClaimManager.stopped !== "boolean"
+    || typeof keyClaimManager.currentClaimPromise?.then !== "function"
+    || typeof keyClaimManager.stop !== "function"
+  )) {
+    throw cryptoDrainFailure(
+      new Error("Matrix crypto key-claim drain is unavailable in the pinned SDK runtime"),
+      { unsafe: true },
+    );
+  }
+  if (outgoingRequests && (
+    typeof outgoingRequests.stopped !== "boolean"
+    || typeof outgoingRequests.outgoingRequestLoopRunning !== "boolean"
+    || typeof outgoingRequests.stop !== "function"
+  )) {
+    throw cryptoDrainFailure(
+      new Error("Matrix crypto outgoing-request drain is unavailable in the pinned SDK runtime"),
+      { unsafe: true },
+    );
+  }
+  const hasCryptoWorkers = Boolean(
+    backupManager || backupDownloader || keyClaimManager || outgoingRequests,
+  );
+  if (hasCryptoWorkers && typeof client?.http?.abort !== "function") {
+    throw cryptoDrainFailure(
+      new Error("Matrix crypto network abort is unavailable in the pinned SDK runtime"),
+      { unsafe: true },
+    );
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  let stoppedListener;
+  let stopped;
+  let syncLoop;
+  if (syncApi?.running === true) {
+    syncLoop = syncApi[MATRIX_SYNC_LOOP_PROMISE];
+    stopped = new Promise((resolveStopped) => {
+      stoppedListener = (state) => {
+        if (String(state).toUpperCase() === "STOPPED") resolveStopped();
+      };
+      client.on("sync", stoppedListener);
+    });
+  }
+  try {
+    if (settleClientOperations) {
+      await waitForCryptoDrainPromise(settleClientOperations(), {
+        deadline,
+        timeoutMs,
+        label: "Matrix encrypted room-send shutdown",
+      });
+    }
+    if (syncApi?.running === true) {
+      syncApi.stop();
+      syncApi.retryImmediately();
+      if (hasCryptoWorkers) client.http.abort();
+      await waitForCryptoDrainPromise(syncLoop
+        ? Promise.race([
+            stopped,
+            Promise.resolve(syncLoop).then(() => undefined, () => undefined),
+          ])
+        : stopped, {
+        deadline,
+        timeoutMs,
+        label: "Matrix sync drain",
+      });
+    }
+    backupManager?.stop();
+    backupDownloader?.stop();
+    keyClaimManager?.stop();
+    outgoingRequests?.stop();
+    if (hasCryptoWorkers) client.http.abort();
+    if (backupManager) {
+      while (
+        backupManager.backupKeysLoopRunning
+        || backupManager.keyBackupCheckInProgress
+      ) {
+        await waitForCryptoDrainFlag(backupManager, "backupKeysLoopRunning", {
+          deadline,
+          timeoutMs,
+          label: "Matrix crypto backup shutdown",
+        });
+        const check = backupManager.keyBackupCheckInProgress;
+        if (check) {
+          await waitForCryptoDrainPromise(check, {
+            deadline,
+            timeoutMs,
+            label: "Matrix crypto backup check shutdown",
+          });
+        }
+      }
+    }
+    if (backupDownloader) {
+      while (
+        backupDownloader.downloadLoopRunning
+        || backupDownloader.currentBackupVersionCheck
+      ) {
+        await waitForCryptoDrainFlag(backupDownloader, "downloadLoopRunning", {
+          deadline,
+          timeoutMs,
+          label: "Matrix crypto backup-download shutdown",
+        });
+        const check = backupDownloader.currentBackupVersionCheck;
+        if (check) {
+          await waitForCryptoDrainPromise(check, {
+            deadline,
+            timeoutMs,
+            label: "Matrix crypto backup-download check shutdown",
+          });
+        }
+      }
+    }
+    if (keyClaimManager) {
+      while (true) {
+        const claim = keyClaimManager.currentClaimPromise;
+        await waitForCryptoDrainPromise(claim, {
+          deadline,
+          timeoutMs,
+          label: "Matrix crypto key-claim shutdown",
+        });
+        if (claim === keyClaimManager.currentClaimPromise) break;
+      }
+    }
+    if (outgoingRequests) {
+      await waitForCryptoDrainFlag(outgoingRequests, "outgoingRequestLoopRunning", {
+        deadline,
+        timeoutMs,
+        label: "Matrix crypto outgoing-request shutdown",
+      });
+    }
+  } catch (error) {
+    throw cryptoDrainFailure(error, { unsafe: true });
+  } finally {
+    if (stoppedListener) client.removeListener("sync", stoppedListener);
+  }
 }
 
 function isAuthRejection(error) {
@@ -454,7 +719,6 @@ class MatrixChannelAdapter {
     this.acceptedEpoch = null;
     this.initialSyncComplete = false;
     this.outboundRoomStateFresh = false;
-    this.pendingRoomSends.clear();
     if (
       !this.lifecyclePromise
       && !this.running
@@ -771,11 +1035,28 @@ class MatrixChannelAdapter {
     let clientStopFailed = false;
     if (clientMustStop) {
       try {
-        await client.stopClient();
+        await this.drainClientCryptoWork(client);
       } catch (error) {
-        clientStopFailed = true;
         errors.push(error);
-        permanent = true;
+        console.warn(
+          `[${CHANNEL_ID}] Matrix crypto startup drain failed`
+          + ` account=${safeLogToken(this.accountId)}`
+          + ` unsafe=${error?.matrixCryptoClientStopUnsafe !== false}`
+          + ` error=${safeLogToken(error?.message, "unknown")}`,
+        );
+        if (error?.matrixCryptoClientStopUnsafe !== false) {
+          clientStopFailed = true;
+          permanent = true;
+        }
+      }
+      if (!clientStopFailed) {
+        try {
+          await client.stopClient();
+        } catch (error) {
+          clientStopFailed = true;
+          errors.push(error);
+          permanent = true;
+        }
       }
     }
     try {
@@ -832,6 +1113,24 @@ class MatrixChannelAdapter {
     const syncListener = this.syncListener;
     const timelineListener = this.timelineListener;
     const decryptedListener = this.decryptedListener;
+    const errors = [];
+    let permanent = false;
+    let clientStopFailed = false;
+    try {
+      await this.drainClientCryptoWork(this.client);
+    } catch (error) {
+      errors.push(error);
+      console.warn(
+        `[${CHANNEL_ID}] Matrix crypto stop drain failed`
+        + ` account=${safeLogToken(this.accountId)}`
+        + ` unsafe=${error?.matrixCryptoClientStopUnsafe !== false}`
+        + ` error=${safeLogToken(error?.message, "unknown")}`,
+      );
+      if (error?.matrixCryptoClientStopUnsafe !== false) {
+        clientStopFailed = true;
+        permanent = true;
+      }
+    }
     this.cryptoRuntime = null;
     this.syncListener = null;
     this.timelineListener = null;
@@ -842,8 +1141,6 @@ class MatrixChannelAdapter {
     this.outboundRoomStateFresh = false;
     this.clearEncryptedEventContexts();
     this.pendingRoomSends.clear();
-    const errors = [];
-    let permanent = false;
     if (syncListener) {
       try {
         this.client.removeListener("sync", syncListener);
@@ -868,13 +1165,14 @@ class MatrixChannelAdapter {
         permanent = true;
       }
     }
-    let clientStopFailed = false;
-    try {
-      await this.client.stopClient();
-    } catch (error) {
-      clientStopFailed = true;
-      errors.push(error);
-      permanent = true;
+    if (!clientStopFailed) {
+      try {
+        await this.client.stopClient();
+      } catch (error) {
+        clientStopFailed = true;
+        errors.push(error);
+        permanent = true;
+      }
     }
     try {
       if (clientStopFailed) await runtime?.quarantine();
@@ -1046,10 +1344,14 @@ class MatrixChannelAdapter {
       epoch: this.acceptedEpoch,
       roomId: chatId,
       eventType,
+      operation: null,
     };
     this.pendingRoomSends.set(txnId, pending);
     try {
-      return await client.sendEvent(chatId, eventType, content, txnId);
+      pending.operation = Promise.resolve().then(
+        () => client.sendEvent(chatId, eventType, content, txnId),
+      );
+      return await pending.operation;
     } finally {
       if (this.pendingRoomSends.get(txnId) === pending) {
         this.pendingRoomSends.delete(txnId);
@@ -1265,6 +1567,47 @@ class MatrixChannelAdapter {
       if (this.cryptoControlPromise === pending) this.cryptoControlPromise = null;
     }).catch(() => undefined);
     return withTimeout(pending, timeoutMs, "Matrix encryption recovery operation");
+  }
+
+  async drainClientCryptoWork(
+    client,
+    { timeoutMs = CRYPTO_STOP_DRAIN_TIMEOUT_MS } = {},
+  ) {
+    if (!this.settings.encryptionEnabled) return;
+    const pendingRoomSends = [...this.pendingRoomSends.values()]
+      .filter((pending) => pending.client === client && pending.operation)
+      .map((pending) => pending.operation);
+    await drainMatrixClientCryptoWork(client, {
+      timeoutMs,
+      ...(pendingRoomSends.length
+        ? {
+            settleClientOperations: () => Promise.allSettled(pendingRoomSends),
+          }
+        : {}),
+    });
+  }
+
+  async waitForInitialSync({ timeoutMs = CRYPTO_CONTROL_TIMEOUT_MS } = {}) {
+    if (!this.running || !this.desiredRunning) {
+      throw new Error("Matrix initial sync requires a running adapter");
+    }
+    const client = this.client;
+    const epoch = this.acceptedEpoch;
+    const deadline = Date.now() + timeoutMs;
+    while (!this.initialSyncComplete) {
+      if (
+        !this.running
+        || !this.desiredRunning
+        || this.client !== client
+        || this.acceptedEpoch !== epoch
+      ) {
+        throw new Error("Matrix adapter changed while waiting for initial sync");
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Matrix initial sync timed out after ${timeoutMs}ms`);
+      }
+      await sleep(Math.min(25, Math.max(1, deadline - Date.now())));
+    }
   }
 
   getEncryptionRecoveryStatus() {

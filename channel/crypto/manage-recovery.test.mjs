@@ -18,6 +18,7 @@ import {
 
 const root = mkdtempSync(join(tmpdir(), "letta-matrix-recovery-cli-"));
 const command = fileURLToPath(new URL("./manage-recovery.mjs", import.meta.url));
+const commandUrl = new URL("./manage-recovery.mjs", import.meta.url).href;
 
 function run(args) {
   return spawnSync(process.execPath, [command, ...args], {
@@ -42,6 +43,18 @@ try {
   let result = run([]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Usage:\n {2}/);
+  result = spawnSync(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    `import { flushOutputAndExit } from ${JSON.stringify(commandUrl)};
+const output = { ok: true, payload: "x".repeat(256 * 1024) };
+process.stdout.write(JSON.stringify(output));
+await flushOutputAndExit(0);`,
+  ], { encoding: "utf8" });
+  assert.equal(result.status, 0);
+  const flushedOutput = JSON.parse(result.stdout);
+  assert.equal(flushedOutput.ok, true);
+  assert.equal(flushedOutput.payload.length, 256 * 1024);
   assert.equal(safeTerminalToken("1\u001b[2Kforged\r\nline\u009b"), "1 [2Kforged  line");
   const managementAccount = recoveryManagementAccount({
     accountId: "main",
@@ -99,7 +112,10 @@ try {
   });
   let capturedManagementAccount;
   let managementStartCount = 0;
+  let managementSyncWaitCount = 0;
+  let managementSyncWaitOptions;
   let managementStopCount = 0;
+  const managementOrder = [];
   const originalLog = console.log;
   try {
     console.log = () => {};
@@ -108,17 +124,31 @@ try {
       createAdapter: (account) => {
         capturedManagementAccount = account;
         return {
-          start: async () => { managementStartCount += 1; },
-          getEncryptionRecoveryStatus: async () => ({
-            serverVersion: null,
-            activeVersion: null,
-            backupUsable: false,
-            secretStorageReady: false,
-            crossSigningReady: false,
-            deviceSignedByOwner: null,
-            recoveryKeyStored: false,
-          }),
-          stop: async () => { managementStopCount += 1; },
+          start: async () => {
+            managementStartCount += 1;
+            managementOrder.push("start");
+          },
+          waitForInitialSync: async (options) => {
+            managementSyncWaitCount += 1;
+            managementSyncWaitOptions = options;
+            managementOrder.push("waitForInitialSync");
+          },
+          getEncryptionRecoveryStatus: async () => {
+            managementOrder.push("getEncryptionRecoveryStatus");
+            return {
+              serverVersion: null,
+              activeVersion: null,
+              backupUsable: false,
+              secretStorageReady: false,
+              crossSigningReady: false,
+              deviceSignedByOwner: null,
+              recoveryKeyStored: false,
+            };
+          },
+          stop: async () => {
+            managementStopCount += 1;
+            managementOrder.push("stop");
+          },
         };
       },
     });
@@ -126,7 +156,13 @@ try {
     console.log = originalLog;
   }
   assert.equal(managementStartCount, 1);
+  assert.equal(managementSyncWaitCount, 1);
+  assert.deepEqual(managementSyncWaitOptions, { timeoutMs: 60_000 });
   assert.equal(managementStopCount, 1);
+  assert.deepEqual(
+    managementOrder,
+    ["start", "waitForInitialSync", "getEncryptionRecoveryStatus", "stop"],
+  );
   assert.deepEqual(
     {
       readReceipts: capturedManagementAccount.config.readReceipts,
@@ -135,6 +171,20 @@ try {
     },
     { readReceipts: false, typingIndicators: false, ackReaction: false },
   );
+
+  let failedWaitStopped = false;
+  await assert.rejects(
+    () => main({
+      argv: ["status", "--accounts-file", encryptedAccounts, "--json"],
+      createAdapter: () => ({
+        start: async () => {},
+        waitForInitialSync: async () => { throw new Error("injected initial sync failure"); },
+        stop: async () => { failedWaitStopped = true; },
+      }),
+    }),
+    /injected initial sync failure/,
+  );
+  assert.equal(failedWaitStopped, true);
 
   result = run([
     "status",

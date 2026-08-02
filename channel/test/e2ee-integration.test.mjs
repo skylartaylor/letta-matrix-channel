@@ -761,6 +761,7 @@ try {
       }
     },
     "local Synapse startup",
+    120_000,
   );
 
   for (const user of ["bot", "peer"]) {

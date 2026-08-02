@@ -5,7 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import "fake-indexeddb/auto";
 import { createClient } from "matrix-js-sdk";
+import { SyncApi } from "matrix-js-sdk/lib/sync.js";
+import {
+  drainMatrixClientCryptoWork,
+  installMatrixSyncLoopTracking,
+} from "../plugin.mjs";
 import { startCryptoRuntime } from "./runtime.mjs";
+
+installMatrixSyncLoopTracking(SyncApi);
 
 const USER_ID = "@bot:example.org";
 const DEVICE_ID = "DEVICE";
@@ -33,14 +40,42 @@ function makeClient() {
   return client;
 }
 
+async function waitUntil(predicate, label, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
 const root = await mkdtemp(join(tmpdir(), "matrix-real-roundtrip-"));
 const stateDir = join(root, "state");
 let first;
 let second;
+let syncProbe;
 let firstRuntime;
 let secondRuntime;
 let testError;
 try {
+  syncProbe = createClient({
+    baseUrl: "http://127.0.0.1:1",
+    accessToken: "test-token",
+    userId: USER_ID,
+    deviceId: DEVICE_ID,
+    localTimeoutMs: 100,
+  });
+  await syncProbe.startClient({ initialSyncLimit: 0 });
+  await waitUntil(
+    () => ["ERROR", "RECONNECTING"].includes(String(syncProbe.syncApi?.getSyncState?.())),
+    "real Matrix SyncApi recovery state",
+  );
+  assert.equal(syncProbe.syncApi?.running, true);
+  await drainMatrixClientCryptoWork(syncProbe, { timeoutMs: 5_000 });
+  assert.equal(syncProbe.syncApi?.running, false);
+  await syncProbe.stopClient();
+  syncProbe = null;
+
   first = makeClient();
   firstRuntime = await startCryptoRuntime({
     client: first,
@@ -54,8 +89,39 @@ try {
   assert.equal(typeof firstKeys.curve25519, "string");
   assert.ok(firstKeys.curve25519);
 
-  // Match plugin shutdown: close the Matrix client before the runtime takes
-  // its final authoritative snapshot and releases persistent ownership.
+  first.clientRunning = true;
+  first.syncApi = new SyncApi(first, { initialSyncLimit: 0 }, {});
+  first.syncApi.syncState = "ERROR";
+  assert.equal(typeof first.syncApi?.getSyncState, "function");
+  assert.equal(typeof first.syncApi?.stop, "function");
+  assert.equal(typeof first.syncApi?.retryImmediately, "function");
+  assert.equal(typeof first.syncApi?.running, "boolean");
+  assert.equal(typeof first.syncApi?.catchingUp, "boolean");
+  assert.equal("currentSyncRequest" in first.syncApi, true);
+  const firstCrypto = first.getCrypto();
+  const firstOutgoing = firstCrypto.outgoingRequestsManager;
+  const firstBackup = firstCrypto.backupManager;
+  const firstBackupDownloader = firstCrypto.perSessionBackupDownloader;
+  const firstKeyClaim = firstCrypto.keyClaimManager;
+  assert.equal(typeof first.http?.abort, "function");
+  assert.equal(typeof firstBackup?.stop, "function");
+  assert.equal(typeof firstBackup?.stopped, "boolean");
+  assert.equal(typeof firstBackup?.backupKeysLoopRunning, "boolean");
+  assert.equal(firstBackup?.keyBackupCheckInProgress, null);
+  assert.equal(typeof firstBackupDownloader?.stop, "function");
+  assert.equal(typeof firstBackupDownloader?.stopped, "boolean");
+  assert.equal(typeof firstBackupDownloader?.downloadLoopRunning, "boolean");
+  assert.equal(firstBackupDownloader?.currentBackupVersionCheck, null);
+  assert.equal(typeof firstKeyClaim?.stop, "function");
+  assert.equal(typeof firstKeyClaim?.stopped, "boolean");
+  assert.equal(typeof firstKeyClaim?.currentClaimPromise?.then, "function");
+  assert.equal(typeof firstOutgoing?.doProcessOutgoingRequests, "function");
+  assert.equal(typeof firstOutgoing?.stop, "function");
+  assert.equal(typeof firstOutgoing?.stopped, "boolean");
+  assert.equal(typeof firstOutgoing?.outgoingRequestLoopRunning, "boolean");
+  // Match plugin shutdown: quiesce SDK crypto work, close the Matrix client,
+  // then take the final authoritative snapshot and release ownership.
+  await drainMatrixClientCryptoWork(first);
   await first.stopClient();
   await firstRuntime.stop();
   first = null;
@@ -73,6 +139,7 @@ try {
   const secondKeys = await second.getCrypto().getOwnDeviceKeys();
   assert.equal(secondKeys.ed25519, firstKeys.ed25519);
   assert.equal(secondKeys.curve25519, firstKeys.curve25519);
+  await drainMatrixClientCryptoWork(second);
   await second.stopClient();
   await secondRuntime.stop();
   second = null;
@@ -85,6 +152,11 @@ try {
 }
 
 const cleanupErrors = [];
+try {
+  await syncProbe?.stopClient();
+} catch (error) {
+  cleanupErrors.push(error);
+}
 for (const [client, runtime] of [[second, secondRuntime], [first, firstRuntime]]) {
   try {
     await client?.stopClient();
