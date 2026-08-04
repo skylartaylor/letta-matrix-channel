@@ -136,6 +136,14 @@ reopen the app after installing or updating this custom plugin. The built-in
 Channels page may not enumerate user-provided channels; listener status and a
 Matrix round trip are the authoritative checks.
 
+Encrypted adapters add a `SIGTERM` guard when Letta identifies the listener as
+Desktop-managed. This keeps the listener alive until asynchronous crypto cleanup
+settles when the app quits or updates. Retryable final-snapshot failures receive
+two bounded retries. After exhausted retries, the signal guard is removed while
+durable ownership stays fail-closed. This does not recover state after a crash
+or forced termination; an unclean active marker still blocks startup for
+explicit inspection.
+
 ## Runtime behavior
 
 - Encrypted startup resolves the authenticated Matrix user and device, restores
@@ -146,6 +154,8 @@ Matrix round trip are the authoritative checks.
   gate again until state is current.
 - Crypto state is checkpointed periodically, before encrypted network writes,
   before acknowledging the next incremental sync, and during clean shutdown.
+- Letta Desktop termination remains handled until encrypted shutdown settles,
+  preventing its status UI from restoring default signal termination early.
 - A failed or unproven shutdown quarantines the encrypted runtime instead of
   pretending it can safely restart.
 - Undecryptable events remain encrypted and produce content-free diagnostics;

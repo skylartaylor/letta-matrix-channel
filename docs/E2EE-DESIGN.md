@@ -98,6 +98,20 @@ Clean shutdown drains work in this order:
 5. the final serialized snapshot;
 6. the owned active marker, state lock, and process guard.
 
+While an encrypted adapter is active in a listener carrying Letta Desktop's
+`LETTA_DESKTOP_MODE=1` marker, it keeps a persistent `SIGTERM` listener
+registered through this sequence. Current Desktop builds use an asynchronous
+one-shot shutdown handler alongside Ink's `signal-exit` listener; without the
+guard, the latter can restore default termination before the former finishes
+awaiting channel cleanup. The guard invokes the same idempotent `stop()` path
+and gives retryable runtime cleanup two bounded retries, including failures
+wrapped by cancelled-start cleanup. It is removed when the lifecycle settles or
+when those retries are exhausted; in the latter case durable ownership remains
+fail-closed while subsequent termination is no longer absorbed. The host then
+resumes its shutdown handler and exits the process. An adapter with startup or
+cleanup in flight also reports itself active to the host, so Letta's
+process-wide `stopAll()` waits for cancellation even before sync starts.
+
 The pinned SDK does not expose all of these lifecycle promises publicly, so the
 adapter validates the expected internal shapes before relying on them. A
 timeout or unknown shape makes shutdown unprovable. In that case it retains

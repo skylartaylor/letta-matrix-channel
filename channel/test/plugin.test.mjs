@@ -374,6 +374,189 @@ try {
     assert.equal(existsSync(join(stateDir, "crypto-idb.snapshot")), true);
   });
 
+  await test("Desktop SIGTERM stays handled until encrypted cleanup settles", async () => {
+    const priorDesktopMode = process.env.LETTA_DESKTOP_MODE;
+    const baselineHandlers = process.listeners("SIGTERM");
+    process.env.LETTA_DESKTOP_MODE = "1";
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      accountId: "desktop-sigterm",
+      config: {
+        encryption: {
+          enabled: true,
+          stateDir: makeCryptoStateDir("desktop-sigterm"),
+        },
+      },
+    });
+    let hostStopPromise;
+    let observedSignalHandlerCount = null;
+    const hostHandler = () => {
+      hostStopPromise = made.adapter.stop();
+    };
+    const signalExitLikeHandler = () => {
+      const testHandlers = process.listeners("SIGTERM")
+        .filter((handler) => !baselineHandlers.includes(handler));
+      observedSignalHandlerCount = testHandlers.length;
+    };
+    try {
+      await made.adapter.start();
+      const guard = made.adapter.desktopSigtermHandler;
+      assert.equal(typeof guard, "function");
+      const realRuntimeStop = made.adapter.cryptoRuntime.stop.bind(
+        made.adapter.cryptoRuntime,
+      );
+      let runtimeStopCalls = 0;
+      made.adapter.cryptoRuntime.stop = async () => {
+        runtimeStopCalls += 1;
+        if (runtimeStopCalls === 1) {
+          const error = new Error("transient Desktop crypto cleanup failure");
+          error.matrixCryptoRuntimeStopRetryable = true;
+          error.matrixCryptoOwnershipRetained = true;
+          throw error;
+        }
+        return await realRuntimeStop();
+      };
+      process.once("SIGTERM", hostHandler);
+      process.on("SIGTERM", signalExitLikeHandler);
+
+      process.emit("SIGTERM");
+      await hostStopPromise;
+
+      assert.equal(observedSignalHandlerCount, 2);
+      assert.equal(runtimeStopCalls, 2);
+      assert.equal(made.adapter.desktopSigtermHandler, null);
+      assert.equal(
+        process.listeners("SIGTERM").includes(guard),
+        false,
+      );
+      assert.equal(client.calls.filter((call) => call === "stopClient").length, 1);
+    } finally {
+      process.removeListener("SIGTERM", hostHandler);
+      process.removeListener("SIGTERM", signalExitLikeHandler);
+      if (priorDesktopMode === undefined) delete process.env.LETTA_DESKTOP_MODE;
+      else process.env.LETTA_DESKTOP_MODE = priorDesktopMode;
+      await made.adapter.stop();
+    }
+  });
+
+  await test("Desktop SIGTERM releases its guard after exhausted cleanup retries", async () => {
+    const priorDesktopMode = process.env.LETTA_DESKTOP_MODE;
+    process.env.LETTA_DESKTOP_MODE = "1";
+    const client = makeEncryptedClient({ initRustCrypto: async () => {} });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      accountId: "desktop-sigterm-retry",
+      config: {
+        encryption: {
+          enabled: true,
+          stateDir: makeCryptoStateDir("desktop-sigterm-retry"),
+        },
+      },
+    });
+    const originalConsoleError = console.error;
+    try {
+      await made.adapter.start();
+      const guard = made.adapter.desktopSigtermHandler;
+      const realRuntimeStop = made.adapter.cryptoRuntime.stop.bind(
+        made.adapter.cryptoRuntime,
+      );
+      let runtimeStopCalls = 0;
+      made.adapter.cryptoRuntime.stop = async () => {
+        runtimeStopCalls += 1;
+        if (runtimeStopCalls <= 3) {
+          const error = new Error("transient Desktop crypto cleanup failure");
+          error.matrixCryptoRuntimeStopRetryable = true;
+          error.matrixCryptoOwnershipRetained = true;
+          throw error;
+        }
+        return await realRuntimeStop();
+      };
+
+      console.error = () => {};
+      guard();
+      const signalStop = made.adapter.lifecyclePromise;
+      await assert.rejects(
+        signalStop,
+        /transient Desktop crypto cleanup failure/,
+      );
+      await Promise.resolve();
+      assert.equal(made.adapter.desktopSigtermHandler, null);
+      assert.equal(process.listeners("SIGTERM").includes(guard), false);
+      assert.equal(runtimeStopCalls, 3);
+      assert.equal(made.adapter.isRunning(), true);
+
+      await made.adapter.stop();
+      assert.equal(runtimeStopCalls, 4);
+      assert.equal(made.adapter.desktopSigtermHandler, null);
+      assert.equal(process.listeners("SIGTERM").includes(guard), false);
+    } finally {
+      console.error = originalConsoleError;
+      if (priorDesktopMode === undefined) delete process.env.LETTA_DESKTOP_MODE;
+      else process.env.LETTA_DESKTOP_MODE = priorDesktopMode;
+      await made.adapter.stop();
+    }
+  });
+
+  await test("Desktop SIGTERM retries wrapped cancellation cleanup", async () => {
+    const priorDesktopMode = process.env.LETTA_DESKTOP_MODE;
+    process.env.LETTA_DESKTOP_MODE = "1";
+    const stateDir = makeCryptoStateDir("desktop-sigterm-cancel-retry");
+    let enteredStartClient;
+    let releaseStartClient;
+    const startClientEntered = new Promise((resolveEntered) => {
+      enteredStartClient = resolveEntered;
+    });
+    const startClientGate = new Promise((resolveStartClient) => {
+      releaseStartClient = resolveStartClient;
+    });
+    const client = makeEncryptedClient({
+      initRustCrypto: async () => {},
+      startClient: async () => {
+        client.calls.push("startClient");
+        enteredStartClient();
+        await startClientGate;
+      },
+    });
+    const made = makeFactoryAdapter({
+      clients: [client],
+      accountId: "desktop-sigterm-cancel-retry",
+      config: { encryption: { enabled: true, stateDir } },
+    });
+    try {
+      const starting = made.adapter.start();
+      await startClientEntered;
+      const realRuntimeStop = made.adapter.cryptoRuntime.stop.bind(
+        made.adapter.cryptoRuntime,
+      );
+      let runtimeStopCalls = 0;
+      made.adapter.cryptoRuntime.stop = async () => {
+        runtimeStopCalls += 1;
+        if (runtimeStopCalls === 1) {
+          const error = new Error("transient cancelled-start release failure");
+          error.matrixCryptoRuntimeStopRetryable = true;
+          error.matrixCryptoOwnershipRetained = true;
+          throw error;
+        }
+        return await realRuntimeStop();
+      };
+
+      made.adapter.desktopSigtermHandler();
+      releaseStartClient();
+      await starting;
+
+      assert.equal(runtimeStopCalls, 2);
+      assert.equal(made.adapter.isRunning(), false);
+      assert.equal(made.adapter.desktopSigtermHandler, null);
+      assert.equal(client.calls.filter((call) => call === "stopClient").length, 1);
+    } finally {
+      releaseStartClient?.();
+      if (priorDesktopMode === undefined) delete process.env.LETTA_DESKTOP_MODE;
+      else process.env.LETTA_DESKTOP_MODE = priorDesktopMode;
+      await made.adapter.stop();
+    }
+  });
+
   await test("encrypted startup only enables an existing backup and installs secret-storage callbacks", async () => {
     const stateDir = makeCryptoStateDir("backup-startup");
     const calls = [];
@@ -1106,6 +1289,7 @@ try {
     });
     const starting = adapter.start();
     await Promise.resolve();
+    assert.equal(adapter.isRunning(), true, "the host must stop an adapter while startup is pending");
     const stopping = adapter.stop();
     release({ user_id: SELF });
     await Promise.all([starting, stopping]);
@@ -1118,6 +1302,8 @@ try {
   });
 
   await test("stop() during crypto startup releases state and never starts sync", async () => {
+    const priorDesktopMode = process.env.LETTA_DESKTOP_MODE;
+    process.env.LETTA_DESKTOP_MODE = "1";
     const stateDir = makeCryptoStateDir("cancel");
     let enteredCrypto;
     let releaseCrypto;
@@ -1146,9 +1332,12 @@ try {
     try {
       const starting = made.adapter.start();
       await cryptoEntered;
+      assert.equal(typeof made.adapter.desktopSigtermHandler, "function");
+      assert.equal(made.adapter.isRunning(), true);
       const stopping = made.adapter.stop();
       releaseCrypto();
       await Promise.all([starting, stopping]);
+      assert.equal(made.adapter.desktopSigtermHandler, null);
       assert.equal(made.adapter.isRunning(), false);
       assert.equal(firstClient.calls.includes("startClient"), false);
       assert.equal(firstClient.calls.filter((call) => call === "stopClient").length, 1);
@@ -1158,6 +1347,9 @@ try {
       assert.equal(secondClient.calls.includes("startClient"), true);
       assert.equal(made.adapter.isRunning(), true);
     } finally {
+      if (priorDesktopMode === undefined) delete process.env.LETTA_DESKTOP_MODE;
+      else process.env.LETTA_DESKTOP_MODE = priorDesktopMode;
+      releaseCrypto?.();
       await made.adapter.stop();
     }
   });

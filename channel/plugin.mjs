@@ -17,6 +17,7 @@ const WHOAMI_RETRY_DELAYS_MS = [500, 1500];
 const WHOAMI_TIMEOUT_MS = 10_000;
 const CRYPTO_CONTROL_TIMEOUT_MS = 5 * 60_000;
 const CRYPTO_STOP_DRAIN_TIMEOUT_MS = 15_000;
+const CRYPTO_STOP_RETRY_DELAYS_MS = [25, 100];
 const MATRIX_SYNC_LOOP_PROMISE = Symbol.for("letta.matrix.syncLoopPromise");
 const MATRIX_SYNC_LOOP_PATCHED = Symbol.for("letta.matrix.syncLoopPatched");
 const TYPING_TIMEOUT_MS = 30_000;
@@ -53,6 +54,19 @@ function nonEmpty(value) {
 function safeLogToken(value, fallback = "unknown") {
   const text = nonEmpty(String(value ?? "")) ?? fallback;
   return text.replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, "_").slice(0, 160);
+}
+
+function hasRetryableCryptoRuntimeStop(error, seen = new Set()) {
+  if (!error || typeof error !== "object" || seen.has(error)) return false;
+  seen.add(error);
+  if (error.matrixCryptoRuntimeStopRetryable === true) return true;
+  if (
+    error instanceof AggregateError
+    && error.errors.some((nested) => hasRetryableCryptoRuntimeStop(nested, seen))
+  ) {
+    return true;
+  }
+  return hasRetryableCryptoRuntimeStop(error.cause, seen);
 }
 
 function roomIsEncrypted(room) {
@@ -637,6 +651,8 @@ class MatrixChannelAdapter {
     this.syncListener = null;
     this.timelineListener = null;
     this.decryptedListener = null;
+    this.desktopSigtermHandler = null;
+    this.desktopSigtermShutdown = false;
   }
 
   createClient() {
@@ -718,6 +734,39 @@ class MatrixChannelAdapter {
     return this.reconcileLifecycle();
   }
 
+  installDesktopSigtermGuard() {
+    if (
+      !this.settings.encryptionEnabled
+      || process.env.LETTA_DESKTOP_MODE !== "1"
+      || this.desktopSigtermHandler
+    ) {
+      return;
+    }
+    // Letta Desktop's status UI also listens for SIGTERM. Keep one persistent
+    // listener registered while async E2EE cleanup runs so that listener cannot
+    // restore the signal's default action before the crypto snapshot is durable.
+    const handler = () => {
+      this.desktopSigtermShutdown = true;
+      void this.stop().catch((error) => {
+        console.error(
+          `[${CHANNEL_ID}] Matrix Desktop SIGTERM cleanup failed`
+          + ` account=${safeLogToken(this.accountId)}:`,
+          error,
+        );
+      });
+    };
+    process.prependListener("SIGTERM", handler);
+    this.desktopSigtermHandler = handler;
+  }
+
+  removeDesktopSigtermGuard() {
+    const handler = this.desktopSigtermHandler;
+    if (!handler) return;
+    process.removeListener("SIGTERM", handler);
+    this.desktopSigtermHandler = null;
+    this.desktopSigtermShutdown = false;
+  }
+
   stop() {
     this.desiredRunning = false;
     this.epoch += 1;
@@ -749,11 +798,39 @@ class MatrixChannelAdapter {
   reconcileLifecycle() {
     if (this.lifecyclePromise) return this.lifecyclePromise;
     const operation = (async () => {
+      let stopRetryIndex = 0;
       while (true) {
-        if (this.desiredRunning) {
-          if (!this.running) await this.performStart();
-        } else if (this.running || this.cryptoRuntime || this.pendingRuntimeStop) {
-          await this.performStop();
+        try {
+          if (this.desiredRunning) {
+            if (!this.running) await this.performStart();
+          } else if (this.running || this.cryptoRuntime || this.pendingRuntimeStop) {
+            await this.performStop();
+          }
+        } catch (error) {
+          const retryableStop = hasRetryableCryptoRuntimeStop(error);
+          const retryDelay = CRYPTO_STOP_RETRY_DELAYS_MS[stopRetryIndex];
+          if (
+            retryDelay !== undefined
+            && retryableStop
+            && !this.desiredRunning
+            && this.pendingRuntimeStop
+            && !this.lifecycleCleanupError
+            && this.desktopSigtermShutdown
+          ) {
+            stopRetryIndex += 1;
+            await sleep(retryDelay);
+            continue;
+          }
+          if (
+            retryableStop
+            && this.desktopSigtermShutdown
+            && this.pendingRuntimeStop
+          ) {
+            // Durable ownership remains fail-closed; only stop absorbing signals
+            // after the bounded shutdown attempts have been exhausted.
+            this.removeDesktopSigtermGuard();
+          }
+          throw error;
         }
 
         const settled = this.desiredRunning
@@ -766,9 +843,23 @@ class MatrixChannelAdapter {
     void operation.then(
       () => {
         if (this.lifecyclePromise === operation) this.lifecyclePromise = null;
+        if (
+          !this.running
+          && !this.cryptoRuntime
+          && !this.pendingRuntimeStop
+        ) {
+          this.removeDesktopSigtermGuard();
+        }
       },
       () => {
         if (this.lifecyclePromise === operation) this.lifecyclePromise = null;
+        if (
+          !this.running
+          && !this.cryptoRuntime
+          && !this.pendingRuntimeStop
+        ) {
+          this.removeDesktopSigtermGuard();
+        }
       },
     );
     return operation;
@@ -819,6 +910,7 @@ class MatrixChannelAdapter {
         };
         this.recoveryKeyStore.setIdentity(cryptoIdentity);
         this.cryptoIdentity = cryptoIdentity;
+        this.installDesktopSigtermGuard();
         runtime = await startCryptoRuntime({
           client,
           accountKey: `${homeserverUrl}\u0000${selfUserId}\u0000${this.accountId}`,
@@ -1205,7 +1297,12 @@ class MatrixChannelAdapter {
   }
 
   isRunning() {
-    return this.running;
+    return Boolean(
+      this.running
+      || this.lifecyclePromise
+      || this.cryptoRuntime
+      || this.pendingRuntimeStop
+    );
   }
 
   remember(eventId) {
