@@ -3503,6 +3503,26 @@ try {
     assert.deepEqual(client.typing.at(-1), [ROOM, false, 30_000]);
   });
 
+  await test("completed tool progress does not restart typing after a reply", async () => {
+    const { adapter, client } = await startedAdapter();
+    await adapter.handleTurnProgressEvent({
+      kind: "tool",
+      state: "started",
+      sources: [{ channel: "matrix", chatId: ROOM }],
+    });
+    await adapter.sendMessage({ chatId: ROOM, text: "done" });
+    const typingCallsAfterReply = client.typing.length;
+
+    await adapter.handleTurnProgressEvent({
+      kind: "tool",
+      state: "completed",
+      sources: [{ channel: "matrix", chatId: ROOM }],
+    });
+
+    assert.equal(client.typing.length, typingCallsAfterReply);
+    assert.deepEqual(client.typing.at(-1), [ROOM, false, 30_000]);
+  });
+
   await test("turn lifecycle and progress events drive typing", async () => {
     const { adapter, client } = await startedAdapter();
     await adapter.handleTurnProgressEvent({ kind: "responding", state: "started", sources: [

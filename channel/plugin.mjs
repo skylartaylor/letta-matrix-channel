@@ -1354,9 +1354,10 @@ class MatrixChannelAdapter {
   }
 
   async handleTurnProgressEvent(event) {
-    const stop = event.state === "error" || event.state === "waiting";
+    const typing = event.state === "started" || event.state === "updated";
+    if (!typing && event.state !== "error" && event.state !== "waiting") return;
     for (const source of event.sources ?? []) {
-      if (source.channel === CHANNEL_ID) this.setTyping(source.chatId, !stop);
+      if (source.channel === CHANNEL_ID) this.setTyping(source.chatId, typing);
     }
   }
 
