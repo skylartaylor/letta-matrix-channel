@@ -635,6 +635,8 @@ class MatrixChannelAdapter {
     this.seenEventIds = new Set();
     this.threadTips = new Map();
     this.lastTypingSentAt = new Map();
+    this.typingRequests = new Map();
+    this.typingTurns = new Map();
     this.warnedEncryptionConditions = new Set();
     this.encryptedEventContexts = new WeakMap();
     this.pendingEncryptedDeliveries = new Map();
@@ -1322,10 +1324,61 @@ class MatrixChannelAdapter {
   setTyping(chatId, typing) {
     if (!this.settings.typingIndicators || typeof this.client.sendTyping !== "function") return;
     if (!this.settings.allowedRooms.has(chatId)) return;
+    if (typing && !this.desiredRunning) return;
     const now = Date.now();
     if (typing && now - (this.lastTypingSentAt.get(chatId) ?? 0) < TYPING_REFRESH_MS) return;
     this.lastTypingSentAt.set(chatId, typing ? now : 0);
-    void Promise.resolve(this.client.sendTyping(chatId, typing, TYPING_TIMEOUT_MS)).catch(() => {});
+    const client = this.client;
+    const send = () => {
+      if (client !== this.client || (typing && !this.desiredRunning)) return;
+      if (typing && this.lastTypingSentAt.get(chatId) === 0) return;
+      return client.sendTyping(chatId, typing, TYPING_TIMEOUT_MS);
+    };
+    // Matrix replaces typing state in request arrival order. A slow start must
+    // settle before the stop is sent, or it can turn typing back on after it.
+    const previous = this.typingRequests.get(chatId);
+    let request;
+    try {
+      request = previous ? previous.then(send) : Promise.resolve(send());
+    } catch (error) {
+      request = Promise.reject(error);
+    }
+    const settled = request.catch(() => {
+      console.warn(
+        `[${CHANNEL_ID}] typing request failed account=${safeLogToken(this.accountId)}`
+        + ` room=${safeLogToken(chatId)} typing=${typing}`,
+      );
+    });
+    this.typingRequests.set(chatId, settled);
+    void settled.then(() => {
+      if (this.typingRequests.get(chatId) === settled) this.typingRequests.delete(chatId);
+    });
+  }
+
+  beginTypingTurn(chatId, messageId, batchId = null) {
+    if (!this.settings.allowedRooms.has(chatId) || !this.desiredRunning) return;
+    let turn = this.typingTurns.get(chatId);
+    if (
+      !turn
+      || (batchId && turn.batchId && batchId !== turn.batchId)
+      || (turn.replied && (!messageId || !turn.messageIds.has(messageId)))
+    ) {
+      turn = { batchId, messageIds: new Set(), replied: false };
+      this.typingTurns.set(chatId, turn);
+    }
+    // The host may acknowledge processing after an early reply. Assigning its
+    // batch to the same inbound message must preserve the answered state.
+    if (batchId) turn.batchId = batchId;
+    if (messageId) turn.messageIds.add(messageId);
+    if (!turn.replied) this.setTyping(chatId, true);
+  }
+
+  typingTurnForSource(source, batchId) {
+    if (source.channel !== CHANNEL_ID) return null;
+    const turn = this.typingTurns.get(source.chatId);
+    if (!turn || (batchId && turn.batchId && batchId !== turn.batchId)) return null;
+    if (source.messageId && !turn.messageIds.has(source.messageId)) return null;
+    return turn;
   }
 
   react(chatId, targetEventId, key) {
@@ -1342,13 +1395,25 @@ class MatrixChannelAdapter {
   // typing self-expires after TYPING_TIMEOUT_MS if the host never sends them.
   async handleTurnLifecycleEvent(event) {
     if (event.type === "queued" && event.source.channel === CHANNEL_ID) {
-      this.setTyping(event.source.chatId, true);
+      this.beginTypingTurn(event.source.chatId, event.source.messageId);
+      return;
+    }
+    if (event.type === "processing") {
+      for (const source of event.sources ?? []) {
+        if (source.channel === CHANNEL_ID) {
+          this.beginTypingTurn(source.chatId, source.messageId, event.batchId);
+        }
+      }
       return;
     }
     if (event.type !== "finished") return;
     for (const source of event.sources ?? []) {
       if (source.channel !== CHANNEL_ID) continue;
-      this.setTyping(source.chatId, false);
+      const turn = this.typingTurnForSource(source, event.batchId);
+      if (turn) {
+        turn.replied = true;
+        this.setTyping(source.chatId, false);
+      }
       if (event.outcome === "completed") this.react(source.chatId, source.messageId, "✅");
     }
   }
@@ -1357,7 +1422,10 @@ class MatrixChannelAdapter {
     const typing = event.state === "started" || event.state === "updated";
     if (!typing && event.state !== "error" && event.state !== "waiting") return;
     for (const source of event.sources ?? []) {
-      if (source.channel === CHANNEL_ID) this.setTyping(source.chatId, typing);
+      const turn = this.typingTurnForSource(source, event.batchId);
+      // Progress can include bookkeeping after MessageChannel sends the reply.
+      // Only an admitted, unanswered turn may refresh the room's indicator.
+      if (turn && !turn.replied) this.setTyping(source.chatId, typing);
     }
   }
 
@@ -1913,7 +1981,7 @@ class MatrixChannelAdapter {
     const forwardCommand = Boolean(command) && COMMAND_WORDS.has(command[1].toLowerCase());
 
     this.markRead(event);
-    this.setTyping(chatId, true);
+    this.beginTypingTurn(chatId, messageId);
     this.react(chatId, messageId, "👀");
     console.info(`[${CHANNEL_ID}] inbound account=${this.accountId} room=${chatId} sender=${senderId} chars=${text.length}`);
     try {
@@ -1985,10 +2053,13 @@ class MatrixChannelAdapter {
     } else if (replyToMessageId) {
       content["m.relates_to"] = { "m.in_reply_to": { event_id: replyToMessageId } };
     }
+    const typingTurn = this.typingTurns.get(chatId);
     const response = await this.sendRoomEvent(chatId, "m.room.message", content);
     const eventId = nonEmpty(response?.event_id);
     if (threadId) this.rememberThreadTip(chatId, threadId, eventId);
-    this.setTyping(chatId, false);
+    if (typingTurn) typingTurn.replied = true;
+    // A new turn may have started while the network send was in flight.
+    if (this.typingTurns.get(chatId) === typingTurn) this.setTyping(chatId, false);
     console.info(`[${CHANNEL_ID}] outbound account=${this.accountId} room=${chatId} chars=${text.length}`);
     return { messageId: eventId ?? "unknown" };
   }

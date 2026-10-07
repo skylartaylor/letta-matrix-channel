@@ -172,6 +172,10 @@ async function waitUntil(predicate, label) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
+async function settleTyping(adapter) {
+  await Promise.all(adapter.typingRequests.values());
+}
+
 const { channelPlugin, installMatrixSyncLoopTracking } = await import("../plugin.mjs");
 
 function makeAdapter({ config = {}, client: clientOverrides = {} } = {}) {
@@ -3505,6 +3509,7 @@ try {
 
   await test("completed tool progress does not restart typing after a reply", async () => {
     const { adapter, client } = await startedAdapter();
+    await adapter.handleTurnLifecycleEvent({ type: "queued", source: { channel: "matrix", chatId: ROOM } });
     await adapter.handleTurnProgressEvent({
       kind: "tool",
       state: "started",
@@ -3523,19 +3528,180 @@ try {
     assert.deepEqual(client.typing.at(-1), [ROOM, false, 30_000]);
   });
 
+  await test("post-reply thinking, memory tools and status do not restart typing", async () => {
+    for (const [kind, state, extra] of [
+      ["thinking", "updated", {}],
+      ["responding", "updated", {}],
+      ["tool", "started", { toolName: "memory" }],
+      ["status", "updated", { message: "Updating memory" }],
+      ["retry", "updated", {}],
+    ]) {
+      const { adapter, client } = await startedAdapter();
+      const sources = [{ channel: "matrix", chatId: ROOM, messageId: "$question" }];
+      await adapter.handleTurnLifecycleEvent({ type: "queued", source: sources[0] });
+      await adapter.handleTurnLifecycleEvent({ type: "processing", batchId: "batch-1", sources });
+      await adapter.sendMessage({ chatId: ROOM, text: "done" });
+      const typingCallsAfterReply = client.typing.length;
+      await adapter.handleTurnProgressEvent({ kind, state, batchId: "batch-1", sources, ...extra });
+      assert.equal(client.typing.length, typingCallsAfterReply, `${kind}/${state} restarted typing`);
+      assert.deepEqual(client.typing.at(-1), [ROOM, false, 30_000]);
+    }
+  });
+
   await test("turn lifecycle and progress events drive typing", async () => {
     const { adapter, client } = await startedAdapter();
+    await adapter.handleTurnLifecycleEvent({ type: "queued", source: { channel: "matrix", chatId: ROOM } });
     await adapter.handleTurnProgressEvent({ kind: "responding", state: "started", sources: [
       { channel: "matrix", chatId: ROOM },
       { channel: "telegram", chatId: "999" },
     ] });
     assert.deepEqual(client.typing, [[ROOM, true, 30_000]], "foreign channels ignored");
     await adapter.handleTurnProgressEvent({ kind: "approval", state: "waiting", sources: [{ channel: "matrix", chatId: ROOM }] });
+    await settleTyping(adapter);
     assert.deepEqual(client.typing.at(-1), [ROOM, false, 30_000]);
     await adapter.handleTurnLifecycleEvent({ type: "queued", source: { channel: "matrix", chatId: ROOM } });
+    await settleTyping(adapter);
     assert.deepEqual(client.typing.at(-1), [ROOM, true, 30_000]);
     await adapter.handleTurnLifecycleEvent({ type: "finished", sources: [{ channel: "matrix", chatId: ROOM }] });
+    await settleTyping(adapter);
     assert.deepEqual(client.typing.at(-1), [ROOM, false, 30_000]);
+  });
+
+  await test("new turns resume typing and ignore old progress and finishes", async () => {
+    const { adapter, client } = await startedAdapter();
+    const first = [{ channel: "matrix", chatId: ROOM, messageId: "$first" }];
+    const second = [{ channel: "matrix", chatId: ROOM, messageId: "$second" }];
+    await adapter.handleTurnLifecycleEvent({ type: "processing", batchId: "first", sources: first });
+    await adapter.sendMessage({ chatId: ROOM, text: "first reply" });
+    await adapter.handleTurnLifecycleEvent({ type: "processing", batchId: "second", sources: second });
+    await settleTyping(adapter);
+    assert.deepEqual(client.typing.at(-1), [ROOM, true, 30_000]);
+    const callsBeforeStaleEvents = client.typing.length;
+    await adapter.handleTurnProgressEvent({ kind: "thinking", state: "updated", batchId: "first", sources: first });
+    await adapter.handleTurnLifecycleEvent({ type: "finished", batchId: "first", sources: first });
+    assert.equal(client.typing.length, callsBeforeStaleEvents);
+    await adapter.handleTurnLifecycleEvent({ type: "finished", batchId: "second", sources: second });
+    await settleTyping(adapter);
+    assert.deepEqual(client.typing.at(-1), [ROOM, false, 30_000]);
+    await adapter.handleTurnProgressEvent({ kind: "status", state: "updated", batchId: "second", sources: second });
+    assert.deepEqual(client.typing.at(-1), [ROOM, false, 30_000]);
+    await emit(client, messageEvent("$third", "matrix another question"));
+    assert.deepEqual(client.typing.at(-1), [ROOM, true, 30_000]);
+  });
+
+  await test("unowned progress cannot start typing", async () => {
+    const { adapter, client } = await startedAdapter();
+    await adapter.handleTurnProgressEvent({ kind: "status", state: "updated", sources: [{ channel: "matrix", chatId: ROOM }] });
+    assert.equal(client.typing.length, 0);
+  });
+
+  await test("delayed processing for the answered message cannot restart typing", async () => {
+    const { adapter, client } = await startedAdapter();
+    const sources = [{ channel: "matrix", chatId: ROOM, messageId: "$early-reply" }];
+    await adapter.handleTurnLifecycleEvent({ type: "queued", source: sources[0] });
+    await adapter.sendMessage({ chatId: ROOM, text: "done" });
+    await settleTyping(adapter);
+    const callsAfterReply = client.typing.length;
+    await adapter.handleTurnLifecycleEvent({ type: "processing", batchId: "delayed", sources });
+    await adapter.handleTurnProgressEvent({ kind: "thinking", state: "updated", batchId: "delayed", sources });
+    await settleTyping(adapter);
+    assert.equal(client.typing.length, callsAfterReply);
+    assert.deepEqual(client.typing.at(-1), [ROOM, false, 30_000]);
+  });
+
+  await test("a delayed typing start cannot overwrite the reply's stop", async () => {
+    let releaseStart;
+    const delivered = [];
+    const { adapter } = await startedAdapter({ client: {
+      sendTyping: async (_room, typing) => {
+        if (typing) await new Promise((resolve) => { releaseStart = resolve; });
+        delivered.push(typing);
+      },
+    } });
+    await adapter.handleTurnLifecycleEvent({ type: "queued", source: { channel: "matrix", chatId: ROOM, messageId: "$slow-typing" } });
+    await adapter.sendMessage({ chatId: ROOM, text: "done" });
+    releaseStart();
+    await waitUntil(() => delivered.length === 2, "typing requests to settle");
+    assert.deepEqual(delivered, [true, false], "late start overwrote stop on the server");
+  });
+
+  await test("queued typing refreshes are skipped once the reply stops typing", async () => {
+    let releaseStart;
+    const delivered = [];
+    let calls = 0;
+    const { adapter } = await startedAdapter({ client: {
+      sendTyping: async (_room, typing) => {
+        if (calls++ === 0) await new Promise((resolve) => { releaseStart = resolve; });
+        delivered.push(typing);
+      },
+    } });
+    const sources = [{ channel: "matrix", chatId: ROOM, messageId: "$queued-refresh" }];
+    await adapter.handleTurnLifecycleEvent({ type: "queued", source: sources[0] });
+    const realNow = Date.now;
+    const later = realNow() + 11_000;
+    try {
+      Date.now = () => later;
+      await adapter.handleTurnProgressEvent({ kind: "thinking", state: "updated", sources });
+    } finally {
+      Date.now = realNow;
+    }
+    await adapter.sendMessage({ chatId: ROOM, text: "done" });
+    releaseStart();
+    await settleTyping(adapter);
+    assert.deepEqual(delivered, [true, false], "obsolete refresh delayed the stop");
+  });
+
+  await test("failed replies leave the active turn eligible for typing", async () => {
+    const { adapter, client } = await startedAdapter({ client: { sendEvent: async () => { throw new Error("send failed"); } } });
+    const sources = [{ channel: "matrix", chatId: ROOM, messageId: "$failed" }];
+    await adapter.handleTurnLifecycleEvent({ type: "processing", batchId: "failed", sources });
+    await assert.rejects(adapter.sendMessage({ chatId: ROOM, text: "reply" }), /send failed/);
+    await adapter.handleTurnProgressEvent({ kind: "approval", state: "waiting", batchId: "failed", sources });
+    await settleTyping(adapter);
+    await adapter.handleTurnProgressEvent({ kind: "thinking", state: "updated", batchId: "failed", sources });
+    await settleTyping(adapter);
+    assert.deepEqual(client.typing.at(-1), [ROOM, true, 30_000]);
+  });
+
+  await test("a reply in flight cannot stop a newer turn", async () => {
+    let finishSend;
+    const { adapter, client } = await startedAdapter({ client: {
+      sendEvent: () => new Promise((resolve) => { finishSend = resolve; }),
+    } });
+    const first = [{ channel: "matrix", chatId: ROOM, messageId: "$in-flight" }];
+    const second = [{ channel: "matrix", chatId: ROOM, messageId: "$new-turn" }];
+    await adapter.handleTurnLifecycleEvent({ type: "processing", batchId: "old", sources: first });
+    const reply = adapter.sendMessage({ chatId: ROOM, text: "old reply" });
+    await waitUntil(() => finishSend, "outbound send to start");
+    await adapter.handleTurnLifecycleEvent({ type: "processing", batchId: "new", sources: second });
+    finishSend({ event_id: "$old-reply" });
+    await reply;
+    await settleTyping(adapter);
+    assert.equal(client.typing.filter(([, typing]) => !typing).length, 0);
+    await adapter.handleTurnProgressEvent({ kind: "approval", state: "waiting", batchId: "new", sources: second });
+    await settleTyping(adapter);
+    await adapter.handleTurnProgressEvent({ kind: "responding", state: "updated", batchId: "new", sources: second });
+    await settleTyping(adapter);
+    assert.deepEqual(client.typing.at(-1), [ROOM, true, 30_000]);
+  });
+
+  await test("failed typing requests do not block later stops or other rooms", async () => {
+    let failStart;
+    const calls = [];
+    const { adapter } = await startedAdapter({ client: {
+      sendTyping: async (roomId, typing) => {
+        calls.push([roomId, typing]);
+        if (roomId === ROOM && typing) await new Promise((_resolve, reject) => { failStart = reject; });
+      },
+    } });
+    await adapter.handleTurnLifecycleEvent({ type: "queued", source: { channel: "matrix", chatId: ROOM } });
+    await adapter.sendMessage({ chatId: ROOM, text: "done" });
+    await adapter.handleTurnLifecycleEvent({ type: "queued", source: { channel: "matrix", chatId: ROOM2 } });
+    assert.deepEqual(calls, [[ROOM, true], [ROOM2, true]], "rooms must not share a request queue");
+    failStart(new Error("typing unavailable"));
+    await settleTyping(adapter);
+    assert.deepEqual(calls.at(-1), [ROOM, false]);
+    assert.equal(adapter.typingRequests.size, 0);
   });
 
   await test("ack reactions are off by default", async () => {
